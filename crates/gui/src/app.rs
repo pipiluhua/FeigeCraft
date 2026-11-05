@@ -20,7 +20,7 @@ use feigecraft_core::config::Config;
 use feigecraft_core::events::AppEvent;
 use feigecraft_core::model::{Direction, DiscoveredDevice, DeviceInfo, DeviceType, FileMetadata};
 use feigecraft_core::node::Node;
-use feigecraft_core::util::{human_size, reveal_path};
+use feigecraft_core::util::{human_size, open_file, reveal_path};
 use tokio::sync::{broadcast, watch};
 
 use crate::emoji::{self, EmojiSet};
@@ -166,6 +166,8 @@ enum MsgAction {
     Cancel(String),
     /// 右击菜单「复制」：把一条文本消息复制到剪贴板。
     Copy(String),
+    /// 双击打开文件本身（用系统默认应用）。
+    OpenFile(PathBuf),
 }
 
 pub struct FeigeCraftApp {
@@ -1625,6 +1627,7 @@ impl FeigeCraftApp {
         }
         match action {
             Some(MsgAction::Reveal(path)) => reveal_path(&path),
+            Some(MsgAction::OpenFile(path)) => open_file(&path),
             Some(MsgAction::Retry(peer, text)) => {
                 self.active = Some(peer);
                 self.send_text_value(text);
@@ -3487,8 +3490,7 @@ fn message_bubble(
     }
 
     // ---------- 交互 ----------
-    // 纯文本气泡的可选中 Label 已负责框选复制 + 右键复制；这里只需给文件气泡
-    // 挂点击（打开文件夹 / 取消传输）。
+    // 文件气泡：双击直接打开文件；右键弹菜单（打开文件所在目录 / 打开文件 / 复制文件名）。
     if message.kind == MessageKind::File {
         let response = ui.interact(
             rect,
@@ -3496,23 +3498,66 @@ fn message_bubble(
             Sense::click(),
         );
 
-        if response.clicked() {
+        // 右键菜单：像主流聊天工具一样，在文件气泡上右键弹出操作项。
+        // 「打开文件所在目录」是首要定位方式；文件已落地时也能直接打开文件本身。
+        let file_path = message.file_path.clone();
+        let is_running = running.is_some();
+        response.context_menu(|ui| {
+            ui.set_min_width(150.0);
+            if file_path.is_some()
+                && ui
+                    .selectable_label(false, tr("打开文件所在目录"))
+                    .clicked()
+            {
+                action = Some(MsgAction::Reveal(file_path.clone().unwrap()));
+            }
+            if file_path.is_some()
+                && ui
+                    .selectable_label(false, tr("打开文件"))
+                    .clicked()
+            {
+                action = Some(MsgAction::OpenFile(file_path.clone().unwrap()));
+            }
+            if ui
+                .selectable_label(false, tr("复制文件名"))
+                .clicked()
+            {
+                let name = if message.file_name.is_empty() {
+                    tr("文件").to_string()
+                } else {
+                    message.file_name.clone()
+                };
+                action = Some(MsgAction::Copy(name));
+            }
+            if is_running {
+                ui.separator();
+                if ui.selectable_label(false, tr("取消传输")).clicked() {
+                    if let Some(session) = message.session_id.clone() {
+                        action = Some(MsgAction::Cancel(session));
+                    }
+                }
+            }
+        });
+
+        // 双击：直接打开文件本身（用系统默认应用）。
+        if response.double_clicked() {
+            if let Some(path) = &message.file_path {
+                action = Some(MsgAction::OpenFile(path.clone()));
+            }
+        }
+        // 单击：传输中则取消；已完成则不做动作（避免和「双击打开」抢）。
+        if response.clicked() && action.is_none() {
             if let Some(session) = message.session_id.clone() {
                 if running.is_some() {
                     action = Some(MsgAction::Cancel(session));
                 }
             }
-            if action.is_none() {
-                if let Some(path) = &message.file_path {
-                    action = Some(MsgAction::Reveal(path.clone()));
-                }
-            }
         }
 
         let hint = if running.is_some() {
-            Some(tr("点击取消传输"))
+            Some(tr("双击打开文件 · 单击取消传输 · 右键打开所在目录"))
         } else {
-            Some(tr("点击打开所在文件夹"))
+            Some(tr("双击打开文件 · 右键打开所在目录"))
         };
         if let Some(text) = hint {
             let _ = response.on_hover_text(text);

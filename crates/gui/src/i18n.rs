@@ -206,8 +206,16 @@ fn translate(zh: &'static str) -> &'static str {
         "[文件] 对方想发送 {} 个文件" => "[File] They want to send {} file(s)",
         "… 还有 {} 个文件" => "… and {} more files",
         "共 {} · 保存在接收目录" => "Total {} · saved to your receive folder",
-        "点击打开所在文件夹" => "Click to open the folder",
-        "点击取消传输" => "Click to cancel",
+        "打开文件所在目录" => "Open containing folder",
+        "打开文件" => "Open file",
+        "复制文件名" => "Copy file name",
+        "取消传输" => "Cancel transfer",
+        "双击打开文件 · 右键打开所在目录" => {
+            "Double-click to open · right-click to reveal"
+        }
+        "双击打开文件 · 单击取消传输 · 右键打开所在目录" => {
+            "Double-click to open · click to cancel · right-click to reveal"
+        },
         // 传输状态
         "发送中" => "Sending",
         "发送完成" => "Sent",

@@ -299,6 +299,15 @@ pub fn reveal_path(path: &Path) {
     let _ = open::that(target);
 }
 
+/// 用系统默认应用打开文件本身；若已不存在则退回到打开所在目录。
+pub fn open_file(path: &Path) {
+    if path.is_file() {
+        let _ = open::that(path);
+    } else {
+        reveal_path(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -82,6 +82,30 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact }}" `
             -DestinationPath ${{ matrix.archive }}
 
+      # Windows 一键安装包（Inno Setup）：从 tag 提取版本号，编译 installer\feigecraft.iss。
+      - name: Build Windows installer (Inno Setup)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          # tag 形如 v1.0.1，去掉 v 前缀得到 1.0.1，用于安装包的版本与文件名。
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          # .iss 里 Source 指向 ..\target\release\feigecraft.exe；CI 用 --target 编译到了
+          # target\x86_64-pc-windows-gnu\release\，复制一份到 .iss 期望的位置。
+          New-Item -ItemType Directory -Force "target\release" | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.artifact }}" "target\release\${{ matrix.artifact }}" -Force
+          # 探测 ISCC.exe：choco 装到 Program Files (x86)，个别机器可能在别处。
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "找不到 ISCC.exe" }
+          # 语言文件：Inno 官方不带简体中文，仓库里带了一份，拷到 Inno 目录。
+          $langDst = Join-Path (Split-Path -Parent $iscc) "Languages\ChineseSimplified.isl"
+          Copy-Item "installer\ChineseSimplified.isl" $langDst -Force
+          & $iscc "/DMyAppVersion=$version" "installer\feigecraft.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败（$LASTEXITCODE）" }
+          # 产物：dist\FeigeCraft-<version>-setup.exe
+          Get-ChildItem "dist\*.exe" | ForEach-Object { Write-Host "installer: $($_.Name)" }
+
       - name: Package (Linux/macOS tar.gz)
         if: matrix.os != 'windows-latest'
         run: |
@@ -89,11 +113,18 @@ jobs:
           chmod +x ${{ matrix.artifact }}
           tar -czf ../../../${{ matrix.archive }} ${{ matrix.artifact }}
 
-      - name: Upload artifact
+      - name: Upload artifact (archive)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
+
+      - name: Upload artifact (Windows installer)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: feigecraft-windows-setup
+          path: dist/*.exe
 
   release:
     needs: build
