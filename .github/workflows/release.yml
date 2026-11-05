@@ -94,10 +94,22 @@ jobs:
           # target\x86_64-pc-windows-gnu\release\，复制一份到 .iss 期望的位置。
           New-Item -ItemType Directory -Force "target\release" | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.artifact }}" "target\release\${{ matrix.artifact }}" -Force
-          # 探测 ISCC.exe：choco 装到 Program Files (x86)，个别机器可能在别处。
-          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-          if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
-          if (-not (Test-Path $iscc)) { throw "找不到 ISCC.exe" }
+          # 探测 ISCC.exe：runner 预装 Inno Setup（choco 提示已安装），但位置不固定。
+          # 逐个候选路径探测，都找不到再在常见目录下搜一次。
+          $candidates = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            "C:\ProgramData\chocolatey\bin\ISCC.exe"
+          )
+          $iscc = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $iscc = $c; break }
+          }
+          if (-not $iscc) {
+            $found = Get-ChildItem "C:\Program Files*\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $iscc = $found.FullName }
+          }
+          if (-not $iscc) { throw "找不到 ISCC.exe" }
           # 语言文件：Inno 官方不带简体中文，仓库里带了一份，拷到 Inno 目录。
           $langDst = Join-Path (Split-Path -Parent $iscc) "Languages\ChineseSimplified.isl"
           Copy-Item "installer\ChineseSimplified.isl" $langDst -Force
