@@ -34,8 +34,8 @@ jobs:
             artifact: feigecraft
             archive: feigecraft-macos-arm64.tar.gz
             setup-msys: "false"
-          # ---- macOS (Intel) ----
-          - os: macos-13
+          # ---- macOS (Intel)：在 arm64 runner 上交叉编译 x86_64 ----
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: feigecraft
             archive: feigecraft-macos-x64.tar.gz
