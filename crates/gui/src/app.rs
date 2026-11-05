@@ -3147,6 +3147,20 @@ fn day_separator(ui: &mut egui::Ui, label: &str) {
     ui.add_space(4.0);
 }
 
+/// 把主窗口收进后台。Windows 用托盘模块的原生 `ShowWindow`（和单实例/托盘的
+/// 唤醒调用对称，避免 winit 可见标志不同步）；其他平台走 viewport 命令隐藏。
+fn hide_main_window(ctx: &egui::Context) {
+    #[cfg(windows)]
+    {
+        crate::tray::hide_main();
+        let _ = ctx;
+    }
+    #[cfg(not(windows))]
+    {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+    }
+}
+
 fn system_line(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -3785,7 +3799,7 @@ impl FeigeCraftApp {
         if self.hide_frames > 0 {
             self.hide_frames -= 1;
             if self.hide_frames == 0 {
-                crate::tray::hide_main();
+                hide_main_window(ctx);
             } else {
                 ctx.request_repaint();
             }
@@ -3794,7 +3808,7 @@ impl FeigeCraftApp {
             if Instant::now() >= at {
                 tracing::debug!("隐藏窗口（转后台）");
                 self.hide_at = None;
-                crate::tray::hide_main();
+                hide_main_window(ctx);
             } else {
                 ctx.request_repaint_after(Duration::from_millis(60));
             }

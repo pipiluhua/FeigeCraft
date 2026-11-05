@@ -13,8 +13,8 @@
 //! 2. 图标右下角加红点（换一个带点的 HICON）；
 //! 3. 不在前台时弹一条系统通知气泡。
 
-#![cfg(windows)]
-
+#[cfg(windows)]
+mod imp {
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -568,3 +568,25 @@ fn make_badged(base: isize, size: i32) -> isize {
         icon
     }
 }
+
+}
+
+#[cfg(not(windows))]
+mod imp {
+    #![allow(unused_variables)]
+    pub fn install(hwnd: isize) {}
+    pub fn uninstall() {}
+    pub fn set_foreground(on: bool) {}
+    pub fn is_foreground() -> bool { true }
+    pub fn quit_requested() -> bool { false }
+    pub fn set_unread(count: usize) {}
+    pub fn bump_unread() {}
+    pub fn notify(title: &str, body: &str) {}
+    pub fn hide_main() {}
+}
+
+#[cfg(windows)]
+pub use imp::*;
+#[cfg(not(windows))]
+pub use imp::*;
+
