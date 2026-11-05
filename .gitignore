@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+/dist
+/crates/*/target
+.test/
+
+# 截图走查 / 一次性脚本的临时目录
+.shots/
+.tmp/
+
+# WorkBuddy 本地项目数据（不属于源码）
+/.workbuddy/
+
+# 便携 / 多开实例的配置目录
+/portable-*/
+
+# 截图工具的中间产物
+*.bmp

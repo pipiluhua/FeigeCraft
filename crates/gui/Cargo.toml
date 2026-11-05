@@ -1,0 +1,23 @@
+[package]
+name = "feigecraft-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FeigeCraft 桌面版：局域网聊天 + 文件快传（egui）"
+
+[[bin]]
+name = "feigecraft"
+path = "src/main.rs"
+
+[dependencies]
+feigecraft-core = { path = "../core" }
+feigecraft-cli = { path = "../cli" }
+eframe = { workspace = true }
+rfd = { workspace = true }
+image = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+# 只为了拿 Win32 的 HWND（设置 Windows 11 的窗口圆角），不参与渲染。
+raw-window-handle = "0.6"

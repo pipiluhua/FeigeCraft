@@ -1,0 +1,31 @@
+[package]
+name = "feigecraft-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FeigeCraft 核心库：LocalSend 兼容的文件传输 + 局域网聊天协议"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+socket2 = { workspace = true }
+if-addrs = { workspace = true }
+dirs = { workspace = true }
+open = { workspace = true }

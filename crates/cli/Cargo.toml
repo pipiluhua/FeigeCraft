@@ -1,0 +1,18 @@
+[package]
+name = "feigecraft-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FeigeCraft 命令行能力：发现、发送、后台接收"
+
+# 不再产出独立 exe：命令由 feigecraft.exe 按子命令分派。
+[lib]
+name = "feigecraft_cli"
+path = "src/lib.rs"
+
+[dependencies]
+feigecraft-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
