@@ -794,7 +794,10 @@ impl FeigeCraftApp {
         let mut ids = Vec::new();
         for file in &files {
             let size = std::fs::metadata(&file.path).map(|meta| meta.len()).unwrap_or(0);
-            let message = ChatMessage::file(&peer, true, file.name.clone(), size);
+            let mut message = ChatMessage::file(&peer, true, file.name.clone(), size);
+            // 发送方也要能双击打开自己发出的文件 / 右键打开所在目录，
+            // 所以把本地源文件路径一起记下来（接收方的路径由 set_file_path 另填）。
+            message.file_path = Some(file.path.clone());
             ids.push(message.id.clone());
             node.state.chats.append(message);
         }
@@ -3867,9 +3870,10 @@ impl FeigeCraftApp {
             return;
         }
         // 窗口直接消失容易让人以为「关掉了」，先让提示露个面再收。
-        tracing::debug!("准备收进后台（1.5s 后隐藏）");
+        // 延迟压到 300ms：既能让提示一闪而过，又不会让人觉得「点了关闭没反应」。
+        tracing::debug!("准备收进后台（300ms 后隐藏）");
         self.toast(tr("已转入后台继续接收，再双击程序即可重新打开"), false);
-        self.hide_at = Some(Instant::now() + Duration::from_millis(1500));
+        self.hide_at = Some(Instant::now() + Duration::from_millis(300));
         ctx.request_repaint_after(Duration::from_millis(60));
     }
 
