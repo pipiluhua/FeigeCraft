@@ -82,6 +82,111 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact }}" `
             -DestinationPath ${{ matrix.archive }}
 
+      # Linux：构建 .deb 一键安装包。
+      # 手动拼 deb 结构（DEBIAN/control + usr/bin + .desktop + 图标），用 dpkg-deb 打包，
+      # 比 cargo-deb 更可控，且能顺带装桌面菜单项与图标。
+      - name: Build .deb package
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -e
+          BIN="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          chmod +x "$BIN"
+          # 版本号优先取 tag（去掉 v 前缀），手动触发时退回 Cargo.toml 里的 workspace 版本。
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          if [ "$VERSION" = "${{ github.ref_name }}" ] && [ -z "${VERSION##*.*.*}" ]; then
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
+          fi
+
+          PKGROOT="packaging/feigecraft_${VERSION}_amd64"
+          rm -rf "$PKGROOT"
+          mkdir -p "$PKGROOT/DEBIAN"
+          mkdir -p "$PKGROOT/usr/bin"
+          mkdir -p "$PKGROOT/usr/share/applications"
+          mkdir -p "$PKGROOT/usr/share/icons/hicolor/256x256/apps"
+          mkdir -p "$PKGROOT/usr/share/doc/feigecraft"
+
+          cp "$BIN" "$PKGROOT/usr/bin/feigecraft"
+          cp installer/feigecraft.desktop "$PKGROOT/usr/share/applications/"
+          cp crates/gui/assets/icon-256.png "$PKGROOT/usr/share/icons/hicolor/256x256/apps/feigecraft.png"
+          cp LICENSE "$PKGROOT/usr/share/doc/feigecraft/copyright"
+
+          cat > "$PKGROOT/DEBIAN/control" <<EOF
+          Package: feigecraft
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: FeigeCraft contributors
+          Depends: libc6 (>= 2.17), libgtk-3-0, libssl3
+          Homepage: https://github.com/pipiluhua/FeigeCraft
+          Description: LAN chat and file transfer
+           FeigeCraft is a lightweight local-area-network chat and file
+           transfer tool, interoperable with the LocalSend protocol.
+          EOF
+
+          dpkg-deb --build --root-owner-group "$PKGROOT" "feigecraft_${VERSION}_amd64.deb"
+          echo "built: feigecraft_${VERSION}_amd64.deb"
+
+      # macOS：把裸可执行文件包成 .app bundle，再打成 .dmg。
+      # 用系统自带 iconutil（png -> icns）与 hdiutil（dmg），无需第三方工具。
+      - name: Build .dmg package
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -e
+          BIN="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          if [ "$VERSION" = "${{ github.ref_name }}" ] && [ -z "${VERSION##*.*.*}" ]; then
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
+          fi
+          # 与 tar.gz 命名一致：arm64 / x64。
+          case "${{ matrix.target }}" in
+            aarch64-*) ARCH="arm64" ;;
+            x86_64-*)  ARCH="x64" ;;
+            *)         ARCH="${{ matrix.target }}" ;;
+          esac
+
+          APP="packaging/FeigeCraft.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          cp "$BIN" "$APP/Contents/MacOS/feigecraft"
+          chmod +x "$APP/Contents/MacOS/feigecraft"
+
+          # Info.plist 里的 ${VERSION} 占位符替换成真实版本号。
+          sed "s/\${VERSION}/${VERSION}/g" installer/macos/Info.plist > "$APP/Contents/Info.plist"
+
+          # png -> icns：iconutil 只认 .iconset 目录（含多分辨率）。
+          ICONSET="packaging/AppIcon.iconset"
+          rm -rf "$ICONSET"
+          mkdir -p "$ICONSET"
+          SRC="crates/gui/assets/icon-256.png"
+          sips -z 16 16   "$SRC" --out "$ICONSET/icon_16x16.png"
+          sips -z 32 32   "$SRC" --out "$ICONSET/icon_16x16@2x.png"
+          sips -z 32 32   "$SRC" --out "$ICONSET/icon_32x32.png"
+          sips -z 64 64   "$SRC" --out "$ICONSET/icon_32x32@2x.png"
+          sips -z 128 128 "$SRC" --out "$ICONSET/icon_128x128.png"
+          sips -z 256 256 "$SRC" --out "$ICONSET/icon_128x128@2x.png"
+          sips -z 256 256 "$SRC" --out "$ICONSET/icon_256x256.png"
+          sips -z 512 512 "$SRC" --out "$ICONSET/icon_256x256@2x.png"
+          sips -z 512 512 "$SRC" --out "$ICONSET/icon_512x512.png"
+          sips -z 1024 1024 "$SRC" --out "$ICONSET/icon_512x512@2x.png"
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+
+          # 打包 dmg：先建一个临时挂载目录，放入 .app 与 Applications 软链，
+          # 再 hdiutil 转成压缩 dmg（这是 Finder 里「拖到 Applications」的标准形态）。
+          DMG_STAGE="packaging/dmg"
+          rm -rf "$DMG_STAGE"
+          mkdir -p "$DMG_STAGE"
+          cp -R "$APP" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+
+          DMG_NAME="feigecraft-macos-${ARCH}.dmg"
+          hdiutil create -volname "FeigeCraft" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_NAME"
+          echo "built: $DMG_NAME"
+
       # Windows 一键安装包（Inno Setup）：从 tag 提取版本号，编译 installer\feigecraft.iss。
       - name: Build Windows installer (Inno Setup)
         if: matrix.os == 'windows-latest'
@@ -137,6 +242,20 @@ jobs:
         with:
           name: feigecraft-windows-setup
           path: dist/*.exe
+
+      - name: Upload artifact (.deb)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: feigecraft-linux-amd64-deb
+          path: feigecraft_*_amd64.deb
+
+      - name: Upload artifact (.dmg)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: feigecraft-macos-${{ matrix.target }}-dmg
+          path: feigecraft-macos-*.dmg
 
   release:
     needs: build

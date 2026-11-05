@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FeigeCraft
+GenericName=LAN Chat & File Transfer
+Comment=局域网聊天与文件快传
+Exec=feigecraft
+Icon=feigecraft
+Terminal=false
+Categories=Network;FileTransfer;Chat;
+Keywords=LAN;chat;transfer;file;
+StartupWMClass=feigecraft
