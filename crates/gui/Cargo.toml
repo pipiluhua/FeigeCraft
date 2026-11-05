@@ -21,3 +21,5 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 # 只为了拿 Win32 的 HWND（设置 Windows 11 的窗口圆角），不参与渲染。
 raw-window-handle = "0.6"
+# 读取剪贴板里的图片（Ctrl+V 粘贴发送）。默认特性 image-data 已含图片读取。
+arboard = "3.7"

@@ -198,6 +198,8 @@ pub struct FeigeCraftApp {
     /// 表情按钮在本帧的屏幕矩形：浮层按它定位，不再挤占输入区高度。
     emoji_anchor: Rect,
     emojis: EmojiSet,
+    /// 从剪贴板粘贴、尚未发送的图片（临时 PNG 路径）。点「发送」时随文字一起发出。
+    pending_images: Vec<PathBuf>,
 
     settings_open: bool,
     settings_tab: SettingsTab,
@@ -314,6 +316,7 @@ impl FeigeCraftApp {
             emoji_open: false,
             emoji_anchor: Rect::NOTHING,
             emojis: EmojiSet::load(ctx),
+            pending_images: Vec::new(),
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
             remark_target: None,
@@ -748,6 +751,15 @@ impl FeigeCraftApp {
 
     fn send_current_text(&mut self) {
         let text = self.composer.trim().to_string();
+        let has_images = !self.pending_images.is_empty();
+        if text.is_empty() && !has_images {
+            return;
+        }
+        // 先把待发送的剪贴板图片发出去（走文件通道），再发文字。
+        if has_images {
+            let images = std::mem::take(&mut self.pending_images);
+            self.send_paths(images);
+        }
         if text.is_empty() {
             return;
         }
@@ -1666,6 +1678,105 @@ impl FeigeCraftApp {
             .stroke(stroke)
             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
             .show(ui, |ui| {
+                // 待发送的剪贴板图片预览：横向一排缩略图，右上角 × 移除。
+                if !self.pending_images.is_empty() {
+                    let mut remove: Option<usize> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        let thumb = 72.0;
+                        for (index, path) in self.pending_images.iter().enumerate() {
+                            let bytes = std::fs::read(path).unwrap_or_default();
+                            let img = image::load_from_memory(&bytes)
+                                .ok()
+                                .map(|im| im.to_rgba8());
+                            let (w, h) = img
+                                .as_ref()
+                                .map(|im| im.dimensions())
+                                .unwrap_or((1, 1));
+                            let color_img = img.map(|im| {
+                                egui::ColorImage::from_rgba_unmultiplied(
+                                    [w as usize, h as usize],
+                                    &im,
+                                )
+                            });
+                            let texture = color_img.map(|ci| {
+                                ui.ctx().load_texture(
+                                    format!("paste-{index}"),
+                                    ci,
+                                    egui::TextureOptions::LINEAR,
+                                )
+                            });
+
+                            let (thumb_rect, _resp) =
+                                ui.allocate_exact_size(Vec2::splat(thumb), Sense::hover());
+                            let painter = ui.painter();
+                            if let Some(texture) = &texture {
+                                let fit = egui::Rect::from_min_max(
+                                    thumb_rect.min + Vec2::splat(3.0),
+                                    thumb_rect.max - Vec2::splat(3.0),
+                                );
+                                // 保持比例、居中裁切填充
+                                let scale = (fit.width() / w as f32)
+                                    .max(fit.height() / h as f32);
+                                let src_w = fit.width() / scale / w as f32;
+                                let src_h = fit.height() / scale / h as f32;
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2((1.0 - src_w) * 0.5, (1.0 - src_h) * 0.5),
+                                    egui::pos2((1.0 + src_w) * 0.5, (1.0 + src_h) * 0.5),
+                                );
+                                painter.image(
+                                    texture.id(),
+                                    fit,
+                                    uv,
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                painter.rect_filled(
+                                    thumb_rect,
+                                    egui::Rounding::same(theme::RADIUS_MD),
+                                    theme::card(),
+                                );
+                            }
+                            painter.rect_stroke(
+                                thumb_rect,
+                                egui::Rounding::same(theme::RADIUS_MD),
+                                Stroke::new(1.0_f32, theme::border()),
+                            );
+                            // 右上角移除按钮
+                            let close_center = thumb_rect.right_top() + Vec2::new(-8.0, 8.0);
+                            let close_rect = egui::Rect::from_center_size(
+                                close_center,
+                                Vec2::splat(18.0),
+                            );
+                            let close_resp = ui.interact(
+                                close_rect,
+                                ui.id().with(("paste-close", index)),
+                                Sense::click(),
+                            );
+                            painter.circle_filled(close_center, 9.0, Color32::from_black_alpha(180));
+                            painter.line_segment(
+                                [
+                                    close_center + Vec2::new(-3.5, -3.5),
+                                    close_center + Vec2::new(3.5, 3.5),
+                                ],
+                                Stroke::new(1.6_f32, Color32::WHITE),
+                            );
+                            painter.line_segment(
+                                [
+                                    close_center + Vec2::new(3.5, -3.5),
+                                    close_center + Vec2::new(-3.5, 3.5),
+                                ],
+                                Stroke::new(1.6_f32, Color32::WHITE),
+                            );
+                            if close_resp.clicked() {
+                                remove = Some(index);
+                            }
+                        }
+                    });
+                    if let Some(index) = remove {
+                        self.pending_images.remove(index);
+                    }
+                    ui.add_space(8.0);
+                }
                 // 三行起步：一行太窄，写两句话就得上下滚，是之前最别扭的一点。
                 let text_edit = egui::TextEdit::multiline(&mut self.composer)
                     .hint_text(
@@ -1704,7 +1815,8 @@ impl FeigeCraftApp {
                         pick = true;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let ready = !self.composer.trim().is_empty();
+                        let ready =
+                            !self.composer.trim().is_empty() || !self.pending_images.is_empty();
                         if ui.add(widgets::primary_button(tr("发送"), ready)).clicked() && ready {
                             self.send_current_text();
                         }
@@ -3780,6 +3892,7 @@ impl eframe::App for FeigeCraftApp {
         self.pump_events();
         self.pump_tasks();
         self.handle_dropped(ctx);
+        self.paste_from_clipboard(ctx);
 
         self.title_bar(ctx);
         self.sidebar(ctx);
@@ -3890,4 +4003,54 @@ impl FeigeCraftApp {
             self.send_paths(dropped);
         }
     }
+
+    /// Ctrl+V 且输入框没聚焦时，把剪贴板里的图片落成临时 PNG 进入待发列表。
+    /// 输入框聚焦时 Ctrl+V 是正常的文字粘贴，这里不拦截。
+    fn paste_from_clipboard(&mut self, ctx: &egui::Context) {
+        if self.active.is_none() {
+            return;
+        }
+        let pasted = ctx.input(|input| {
+            input.modifiers.command && input.key_pressed(egui::Key::V)
+        });
+        if !pasted || self.composer_focused {
+            return;
+        }
+        match clipboard_image_to_png() {
+            Ok(Some(path)) => {
+                self.pending_images.push(path);
+                self.toast(tr("已粘贴图片，点发送即可发出"), false);
+            }
+            Ok(None) => {
+                // 剪贴板里没有图片，忽略（可能是纯文字，等用户点输入框再粘）。
+            }
+            Err(err) => {
+                self.toast(tf(tr("读取剪贴板图片失败：{}"), &[&err]), true);
+            }
+        }
+    }
+}
+
+/// 读取系统剪贴板里的图片，编码成 PNG 写进临时目录，返回文件路径。
+/// 剪贴板里没有图片时返回 `Ok(None)`。
+fn clipboard_image_to_png() -> Result<Option<PathBuf>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|err| err.to_string())?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        // 剪贴板里没有图片（比如只有文字）——正常情况，静默忽略。
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    // RGBA 原始字节 → image crate 的 RgbaImage → 编码 PNG。
+    let rgba =
+        image::RgbaImage::from_raw(image.width as u32, image.height as u32, image.bytes.into_owned())
+            .ok_or_else(|| "图片数据长度与尺寸不符".to_string())?;
+    let dir = std::env::temp_dir().join("feigecraft");
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(format!("paste-{}.png", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)));
+    rgba.save_with_format(&path, image::ImageFormat::Png).map_err(|err| err.to_string())?;
+    Ok(Some(path))
 }
