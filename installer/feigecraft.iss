@@ -10,7 +10,7 @@
 
 ; 版本号由构建脚本从 Cargo.toml 读出来传进来，这里留个兜底。
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.1"
+  #define MyAppVersion "1.0.2"
 #endif
 
 [Setup]
