@@ -29,7 +29,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 dirs = "5"
 open = "5"
