@@ -1,375 +1,401 @@
-# FeigeCraft · 局域网聊天与快传（Rust）
+# FeigeCraft · LAN Chat & File Transfer (Rust)
 
-用 Rust 从零实现的局域网工具：**界面与交互按聊天软件来做（会话列表 / 气泡 / 表情）**，
-文件传输协议**与 [LocalSend](https://github.com/localsend/localsend) 完全互通**。
-同一网段内的手机、电脑打开 LocalSend 或 FeigeCraft，就能互相发现、聊天、互发文件，全程不经过任何服务器。
+> 🌐 **English** · [简体中文](README.zh-CN.md)
 
-- 纯 Rust 实现，单个可执行文件，无运行时依赖
-- 桌面 GUI（[egui](https://github.com/emilk/egui)，OpenGL 渲染，Windows / macOS / Linux 通用）
-- 一个 exe 两种形态：双击是窗口，带子命令就是命令行（服务器、树莓派、无桌面环境都能跑）
-- **局域网聊天**：文字消息、表情、聊天记录本地持久化、失败可重发
-- **自动发现**：打开就在线，无需添加好友、无需输 IP；组播被屏蔽时可退化为子网扫描
-- **多网段**：有线 / Wi-Fi / 虚拟网卡各绑一个组播套接字，一个网段都不漏；跨网段可填 `192.168.2.0/24` 扫整段
-- **随机用户名**：首次启动随机取一个「形容词 + 名词」（中文界面如「安静的柠檬」，
-  英文界面如「Quiet Kite」），避免一堆 `DESKTOP-XXXX` 撞名
-- **多语言**：简体中文 / English，可跟随系统；设置里切换即时生效，不用重启
-- **备注名**：自己起名、给别人改备注，备注只存在本机；设了备注后界面显示为
-  「原昵称（备注名）」，对方改名也对得上号
-- **后台常驻**：点 × 只收进托盘，接收与聊天照常；有新消息时图标带红点并弹系统通知，再双击即回前台
-- 传输：HTTPS + 自签名证书 + **证书指纹固定**（防局域网中间人）
-- 流式落盘：边传边写，先写 `.part` 再原子改名，10 GB 文件也不吃内存
-- 实时进度、速度、取消、拒绝、自动接受
+A LAN utility built from scratch in Rust: the **UI and interactions follow chat apps (conversation list / bubbles / emoji)**,
+and the file-transfer protocol is **fully interoperable with [LocalSend](https://github.com/localsend/localsend)**.
+Phones and computers on the same network can discover, chat with, and send files to each other by running either
+LocalSend or FeigeCraft — all without going through any server.
+
+- Pure Rust, a single executable, no runtime dependencies
+- Desktop GUI ([egui](https://github.com/emilk/egui), OpenGL rendering, works on Windows / macOS / Linux)
+- One executable, two forms: double-click for the window, subcommands for the command line (servers, Raspberry Pi, headless machines)
+- **LAN chat**: text messages, emoji, persistent chat history, retry on failure
+- **Auto discovery**: online as soon as it opens — no friend requests, no typing IPs; falls back to subnet scanning when multicast is blocked
+- **Multi-interface**: wired / Wi-Fi / virtual adapters each bind their own multicast socket; scan a whole subnet with `192.168.2.0/24`
+- **Random username**: a random "adjective + noun" on first launch ("Quiet Kite" in English, "安静的柠檬" in Chinese) — no more collisions of `DESKTOP-XXXX`
+- **Multilingual**: Simplified Chinese / English, follows the system; switching in settings takes effect immediately, no restart
+- **Nicknames**: rename yourself or others; nicknames are stored locally only. When set, the UI shows "original name (nickname)", and renames still match the same person
+- **Background tray**: clicking × only hides to the tray; receiving and chat continue. New messages show a red dot on the icon and a system notification; double-click brings it back
+- Transfer: HTTPS + self-signed certificate + **certificate pinning** (guards against LAN MITM)
+- Streaming writes: writes a `.part` file then atomically renames; 10 GB files don't blow up memory
+- Live progress, speed, cancel, reject, auto-accept
 
 ```
-┌──────────────┐   组播 UDP 53317     ┌──────────────┐
-│ FeigeCraft A │◀────────────────────▶│  LocalSend   │
-│              │                      │ 或 FeigeCraft│
-│  HTTPS Server│◀──── 文件 / 聊天 ────│      B       │
-└──────────────┘   TLS + 指纹校验      └──────────────┘
+┌──────────────┐   multicast UDP 53317   ┌──────────────┐
+│ FeigeCraft A │◀───────────────────────▶│  LocalSend   │
+│              │                         │  or FeigeCraft│
+│  HTTPS Server│◀──── files / chat ──────│      B       │
+└──────────────┘   TLS + fingerprint     └──────────────┘
 ```
 
-## 界面
+## Screenshots
 
-| 深色（默认跟随系统） | 浅色 |
+| Dark (follows system by default) | Light |
 | --- | --- |
-| ![聊天](docs/screenshot-chat.png) | ![浅色聊天](docs/screenshot-chat-light.png) |
+| ![Chat](docs/screenshot-chat.png) | ![Light chat](docs/screenshot-chat-light.png) |
 
-| 设置面板 | 收到文件请求 |
+| Settings panel | Incoming file request |
 | --- | --- |
-| ![设置](docs/screenshot-settings.png) | ![接收文件](docs/screenshot-incoming.png) |
+| ![Settings](docs/screenshot-settings.png) | ![Incoming file](docs/screenshot-incoming.png) |
 
-| 表情面板（浮层） | 设置弹窗（关于） |
+| Emoji panel (floating) | Settings dialog (About) |
 | --- | --- |
-| ![表情](docs/screenshot-emoji.png) | ![设置-关于](docs/screenshot-settings-about.png) |
+| ![Emoji](docs/screenshot-emoji.png) | ![Settings - About](docs/screenshot-settings-about.png) |
 
-| 修改备注 | 手动连接 / 跨网段扫描 |
+| Edit nickname | Manual connect / subnet scan |
 | --- | --- |
-| ![修改备注](docs/screenshot-remark.png) | ![手动连接](docs/screenshot-connect.png) |
+| ![Edit nickname](docs/screenshot-remark.png) | ![Manual connect](docs/screenshot-connect.png) |
 
-| 「更多」菜单 | English 界面 |
+| "More" menu | English UI |
 | --- | --- |
-| ![更多菜单](docs/screenshot-menu.png) | ![英文界面](docs/screenshot-language.png) |
+| ![More menu](docs/screenshot-menu.png) | ![English UI](docs/screenshot-language.png) |
 
-布局刻意贴齐主流聊天软件：左侧会话列表（头像、名字、最后一条消息、时间、未读数），
-右侧消息流（对方左侧灰气泡、自己右侧蓝气泡、消息旁头像、日期分隔线、气泡内右下角的时间与送达状态），
-底部输入区（表情面板、附件、回车发送 / Shift+回车换行）。
-别人给你发文件时不再弹模态框打断聊天，而是在消息流里插一张「接受 / 拒绝」卡片。
+The layout deliberately mirrors mainstream chat apps: a conversation list on the left (avatar, name, last message,
+time, unread count), a message stream on the right (peer bubbles on the left in gray, your bubbles on the right in blue,
+avatars beside messages, date separators, timestamp and delivery status in the bubble's bottom-right), and an input
+area at the bottom (emoji panel, attachments, Enter to send / Shift+Enter for a newline).
+Incoming file requests no longer pop a modal that interrupts the chat — instead an "Accept / Reject" card is inserted into the stream.
 
-**表情**：面板里是 Twemoji 的彩色 PNG（CC-BY 4.0，素材与署名见 `crates/gui/assets/emoji/`）。
-点笑脸后是一块**浮层**贴着输入框上沿弹出，不改变输入区高度、不挤压消息流；
-点外面、按 ESC 或再点一次笑脸即可收起。egui 的字体栈只能取到 emoji 字体的轮廓层（黑白），
-所以气泡里的表情一律走贴图：整条消息只有表情时贴成大表情；夹在文字中间时按 17px 贴图、
-参与逐字换行（表情字形的墨迹常比度量宽度宽，交给字体会被气泡边缘裁掉）。
+**Emoji**: the panel uses Twemoji's color PNGs (CC-BY 4.0; assets and attribution in `crates/gui/assets/emoji/`).
+Clicking the smiley opens a **floating** layer above the input box — it doesn't resize the input or squeeze the message
+stream; click outside, press ESC, or click the smiley again to dismiss. egui's font stack can only get the outline layer
+of emoji fonts (black-and-white), so emoji in bubbles are always drawn as textures: a message that is only emoji renders
+as a big sticker; emoji mixed into text render at 17px and participate in per-character wrapping.
 
-**设置**：自绘模态框（左侧「外观 / 身份 / 传输 / 关于」导航 + 右侧内容），
-外观页用三张「迷你聊天窗口」预览卡直接展示真实配色，点一下即时预览，保存才落盘。
+**Settings**: a self-drawn modal (left "Appearance / Identity / Transfer / About" navigation + right content).
+The Appearance page previews real color schemes with three "mini chat window" cards — click to preview instantly, save to persist.
 
-**主题**：深色 / 浅色 / 跟随系统三选一（设置 → 外观，默认跟随系统，跟随系统时随操作系统实时切换）。
-窗口标题栏是自绘的（`with_decorations(false)`），跟着主题一起变色，不会出现深色界面顶着一根亮白条的情况；
-拖动、双击最大化、贴边分屏仍交给系统处理。无边框窗口在浅色主题下容易和旁边的白窗口糊成一片，
-所以最外沿补了一圈 1px 中性灰描边 + 1px 极淡内阴影（最大化时自动省略）。
+**Theme**: dark / light / follow-system (Settings → Appearance, defaults to follow-system, switching live with the OS).
+The window title bar is self-drawn (`with_decorations(false)`) and follows the theme, so you never get a dark UI under a
+bright white bar; drag, double-click-to-maximize, and edge snapping still go through the system. A borderless window in the
+light theme can blur into adjacent white windows, so a 1px neutral-gray outline plus a 1px ultra-light inner shadow wraps
+the outer edge (omitted automatically when maximized).
 
-**圆角**统一成三档：小控件 6px（菜单项、图标按钮）、常规块 8px（按钮、列表行、气泡）、
-大块 10px（窗口、弹窗、下拉菜单）。窗口本身用 Windows 11 的 DWM 原生圆角
-（`DWMWA_WINDOW_CORNER_PREFERENCE`），系统会把整个窗口连同阴影一起裁圆，
-比在 egui 里画假圆角干净——egui 的裁剪只有矩形，自己画只能"糊"四个角。
+**Corner radius** uses three tiers: small controls 6px (menu items, icon buttons), regular blocks 8px (buttons, list rows,
+bubbles), large blocks 10px (window, dialogs, dropdowns). The window itself uses Windows 11's native DWM rounding
+(`DWMWA_WINDOW_CORNER_PREFERENCE`) — the system clips the whole window including the shadow, cleaner than faking rounded
+corners in egui (whose clipping is rectangle-only).
 
-**更多菜单**是自绘的：菜单项平时透明，只在 hover 时出色块，危险操作（清空聊天记录）用红字；
-菜单右对齐到按钮下方，宽度按当前语言最长的文案实测，不会伸出窗口被裁掉。
+**"More" menu** is self-drawn: items are transparent until hovered, dangerous actions (clear chat history) are in red;
+the menu right-aligns under the button and sizes to the longest label in the current language, never overflowing the window.
 
-**多语言**：`crates/gui/src/i18n.rs` 里用**中文原文当 key**（`tr("设置")`），英文表里没有的条目
-自动回退到中文——新增一处文案不必先注册 id，也不会出现界面上冒出 `settings.title` 这种事。
-带变量的句子写成 `tf(tr("在线 · {}"), &[&ip])`，参数按 `{}` 出现顺序排列。
-语言偏好存 `config.json` 的 `language`（`system` / `zh-CN` / `en`），`system` 走
-`GetUserDefaultUILanguage`（非 Windows 读 `LANG`）判定；切换后立即重绘，不需要重启。
-新增语言只要在 `i18n.rs` 里加一个 `Lang` 变体、一张译文表。
+**i18n**: `crates/gui/src/i18n.rs` uses **the Chinese source text as the key** (`tr("设置")`); entries missing from the
+English table fall back to Chinese automatically — adding a string doesn't require pre-registering an id, and you'll never
+see `settings.title` leak into the UI. Strings with variables are written as `tf(tr("Online · {}"), &[&ip])`, with arguments
+ordered by the position of `{}`. The language preference is stored in `config.json`'s `language` (`system` / `zh-CN` / `en`);
+`system` uses `GetUserDefaultUILanguage` (reads `LANG` on non-Windows). Switching redraws immediately, no restart. Adding a
+language is just a new `Lang` variant plus a translation table in `i18n.rs`.
 
-应用图标（纸飞机）用 `scripts/make-icon.py` 生成，`crates/gui/build.rs` 通过 windres 把它和版本信息
-一起嵌进 exe；窗口图标则用同一张 PNG 在运行时设置，任务栏、Alt-Tab、资源管理器三处一致。
+The app icon (paper plane) is generated by `scripts/make-icon.py`, and `crates/gui/build.rs` embeds it plus version info into
+the exe via windres; the window icon uses the same PNG at runtime, so the taskbar, Alt-Tab, and Explorer are all consistent.
 
-## 目录结构
+## Directory Structure
 
 ```
 LocalSend/
 ├── Cargo.toml              # workspace
 ├── crates/
-│   ├── core/               # 协议核心库 feigecraft-core
-│   │   ├── model.rs        # 数据模型（camelCase，对齐 LocalSend 2.x）
-│   │   ├── tls.rs          # 自签名证书 / 指纹 / 证书 pinning 校验
-│   │   ├── discovery.rs    # 组播发现（双套接字）+ 子网扫描
-│   │   ├── server.rs       # 接收端：HTTPS + v2 REST API + 聊天接口
-│   │   ├── client.rs       # 发送端：register → prepare → upload / send_chat
-│   │   ├── chat.rs         # 聊天模型、会话线程、chats.json 持久化
-│   │   ├── state.rs        # 共享运行时状态、备注名、事件总线
-│   │   ├── events.rs       # 前端可见的事件枚举
-│   │   ├── node.rs         # 组装节点（服务端 + 发现 + 聊天库）
-│   │   ├── util.rs         # 文件名清洗 / 体积格式化 / 网段计算
-│   │   ├── config.rs       # 配置持久化
-│   │   └── ../tests/e2e.rs # 真实 TLS 收发 / 拒绝 / 聊天的端到端测试
-│   ├── cli/                # 命令行能力（编成库，挂在同一个 exe 上）
-│   └── gui/                # 桌面端 feigecraft（egui/eframe）
-│       ├── app.rs          # 界面与交互（会话列表 / 消息流 / 输入区 / 弹窗）
-│       ├── theme.rs        # 设计令牌（配色 / 圆角）、深/浅两套主题、字体
-│       ├── i18n.rs         # 界面多语言（中文原文作 key，缺译文回退中文）
-│       ├── widgets.rs      # 头像、矢量图标、气泡、窗口按钮等组件
-│       ├── instance.rs     # 单实例互斥 + 控制端口「叫醒」窗口
-│       ├── emoji.rs        # Twemoji 贴图加载与绘制
-│       ├── build.rs        # 把图标与版本信息嵌入 Windows exe
-│       ├── assets/         # 应用图标 + 表情素材（含授权说明）
-│       └── capture.rs      # 内建截图（文档 / 回归验收用）
+│   ├── core/               # protocol core library feigecraft-core
+│   │   ├── model.rs        # data model (camelCase, aligned with LocalSend 2.x)
+│   │   ├── tls.rs          # self-signed cert / fingerprint / certificate pinning
+│   │   ├── discovery.rs    # multicast discovery (dual sockets) + subnet scan
+│   │   ├── server.rs       # receiver: HTTPS + v2 REST API + chat endpoints
+│   │   ├── client.rs       # sender: register → prepare → upload / send_chat
+│   │   ├── chat.rs         # chat model, conversation threads, chats.json persistence
+│   │   ├── state.rs        # shared runtime state, nicknames, event bus
+│   │   ├── events.rs       # UI-facing event enum
+│   │   ├── node.rs         # node assembly (server + discovery + chat library)
+│   │   ├── util.rs         # filename sanitization / size formatting / subnet math
+│   │   ├── config.rs       # config persistence
+│   │   └── ../tests/e2e.rs # end-to-end tests: real TLS transfer / reject / chat
+│   ├── cli/                # command-line capabilities (compiled as a lib, same exe)
+│   └── gui/                # desktop feigecraft (egui/eframe)
+│       ├── app.rs          # UI and interactions (conversation list / stream / input / dialogs)
+│       ├── theme.rs        # design tokens (colors / radius), dark/light themes, fonts
+│       ├── i18n.rs         # UI localization (Chinese source as key, fallback to Chinese)
+│       ├── widgets.rs      # avatar, vector icons, bubbles, window buttons, etc.
+│       ├── instance.rs     # single-instance mutex + control-port "wake" the window
+│       ├── emoji.rs        # Twemoji texture loading and drawing
+│       ├── build.rs        # embed icon and version info into the Windows exe
+│       ├── assets/         # app icon + emoji assets (with licensing)
+│       └── capture.rs      # built-in screenshot (for docs / regression acceptance)
 ├── scripts/                # make-icon.py / fetch-emoji.sh / bmp2png.py / build-installer.ps1
-├── installer/              # Inno Setup 脚本 + 简体中文语言文件
-└── docs/                   # 界面截图
+├── installer/              # Inno Setup script + Simplified Chinese language file
+└── docs/                   # UI screenshots
 ```
 
-## 安装（Windows）
+## Installation
 
-不需要装 Rust：从 **Releases** 下载 `FeigeCraft-<版本>-setup.exe` 双击即可。
-（`dist/` 是本地产物目录，已在 `.gitignore` 里，安装包不进仓库，由发版时上传到 Releases。）
+### Windows
 
-- 向导中英双语，默认跟随系统语言；可选桌面快捷方式、开机自启
-- 默认装到 `C:\Program Files\FeigeCraft`（管理员权限），并顺手在防火墙里放行本程序；
-  选「仅为我安装」则装到 `%LOCALAPPDATA%\Programs\FeigeCraft`，不改防火墙，
-  此时若别的设备发现不到本机，手动放行 53317（TCP+UDP）即可
-- 卸载入口在「设置 → 应用」和开始菜单里；只删程序文件，配置、
-  聊天记录和收到的文件都不动
+No Rust required: download `FeigeCraft-<version>-setup.exe` from **Releases** and double-click.
+(`dist/` is the local build output, already in `.gitignore`; the installer is uploaded to Releases at release time, not committed.)
 
-安装包没有代码签名，`dist/` 里直接双击新构建的 exe 时，SmartScreen 可能提示
-「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」即可。
+- Bilingual wizard (Simplified Chinese / English), follows the system language by default; optional desktop shortcut and auto-start
+- Installs to `C:\Program Files\FeigeCraft` by default (admin rights) and adds a firewall rule for the app;
+  choose "install for me only" to install to `%LOCALAPPDATA%\Programs\FeigeCraft` without touching the firewall —
+  in that case, if other devices can't find this machine, allow port 53317 (TCP+UDP) manually
+- Uninstall from "Settings → Apps" or the Start menu; it only removes program files — config,
+  chat history, and received files are left untouched
 
-### 自己构建安装包
+The installer is not code-signed; double-clicking a freshly built exe from `dist/` may trigger SmartScreen's
+"Windows protected your PC" — click "More info → Run anyway".
+
+#### Building the installer yourself
 
 ```powershell
-# 只需一次：装 Inno Setup 6
+# One-time: install Inno Setup 6
 winget install --id JRSoftware.InnoSetup --exact
 
-# 每次出包
+# Each release
 powershell -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 ```
 
-脚本会从 `Cargo.toml` 读版本号 → `cargo build --release` →
-调 ISCC 编译 `installer/feigecraft.iss`，产物是 `dist/FeigeCraft-<版本>-setup.exe`。
-加 `-SkipBuild` 可以跳过编译、直接用现成的 exe 打包。
+The script reads the version from `Cargo.toml` → `cargo build --release` → runs ISCC to compile
+`installer/feigecraft.iss`, producing `dist/FeigeCraft-<version>-setup.exe`. Add `-SkipBuild` to skip
+compilation and package an existing exe.
 
-## 快速开始
+### Linux
 
-需要 Rust 1.78+：
+Download `feigecraft_<version>_amd64.deb` from **Releases** and install:
+
+```bash
+sudo dpkg -i feigecraft_<version>_amd64.deb
+```
+
+This installs `feigecraft` to `/usr/bin`, adds a desktop menu entry, and installs the app icon.
+It depends on `libgtk-3-0` and `libssl3`, which are present on most desktop distros.
+
+### macOS
+
+Download `feigecraft-macos-<arch>.dmg` from **Releases** (`arm64` for Apple Silicon, `x64` for Intel),
+open it, and drag **FeigeCraft** into **Applications**.
+
+> The binaries are not notarized/signed. On first launch macOS may block it — right-click the app and
+> choose "Open", then confirm in the dialog (or run `xattr -dr com.apple.quarantine /Applications/FeigeCraft.app`).
+
+## Quick Start
+
+Requires Rust 1.78+:
 
 ```bash
 cargo run -p feigecraft-gui --release
 ```
 
-编译产物只有**一个** `target/release/feigecraft`（Windows 下是 `feigecraft.exe`）：
-它既是桌面程序，也是命令行工具。带子命令时不弹窗口，跑完直接退出。
+The build produces a **single** `target/release/feigecraft` (`feigecraft.exe` on Windows):
+it's both a desktop app and a command-line tool. With a subcommand it doesn't open a window — it runs and exits.
 
-### 命令行
+### Command Line
 
 ```bash
-feigecraft discover                              # 扫一遍局域网设备
-feigecraft send ./photo.jpg --to "小米手机"       # 发送文件（--to 可用别名 / IP / 指纹）
-feigecraft send ./movie.mp4 --to 192.168.1.23    # 直接指定 IP，跳过发现
-feigecraft chat "文件收到了" --to "小米手机"       # 发一条聊天消息
-feigecraft info                                  # 本机别名、端口、证书指纹
+feigecraft discover                              # scan the LAN for devices
+feigecraft send ./photo.jpg --to "Pixel Phone"   # send a file (--to accepts alias / IP / fingerprint)
+feigecraft send ./movie.mp4 --to 192.168.1.23    # specify the IP directly, skip discovery
+feigecraft chat "Got it" --to "Pixel Phone"      # send a chat message
+feigecraft info                                  # local alias, port, certificate fingerprint
 ```
 
-用 cargo 跑则写成 `cargo run -p feigecraft-gui --release -- <子命令>`。
+With cargo: `cargo run -p feigecraft-gui --release -- <subcommand>`.
 
-## 后台运行
+## Background Running
 
-两种方式，按场景挑：
+Two modes, pick by scenario:
 
-**① 窗口收进后台**：点 × 不再退出程序，只是把窗口藏起来，接收和聊天照常工作。
-再双击一次程序（或开始菜单图标）窗口就回来，**不会**开出第二个实例。
-开关在「设置 → 传输 → 关闭窗口时」，默认开着；关掉它，× 就恢复成直接退出。
+**① Hide to background**: clicking × no longer quits — it just hides the window while receiving and chat continue.
+Run the program again (or click the Start menu icon) brings the window back, **without** launching a second instance.
+Toggle in "Settings → Transfer → On close", on by default; turn it off and × quits directly.
 
-窗口收起后任务栏右下角（托盘）仍有图标：左键点一下唤回窗口，右键菜单可以
-「显示主窗口 / 退出」。收到新消息或文件请求时，图标右下角会出现红点、
-悬停提示带未读数，不在前台时还会弹一条系统通知气泡。
-退出程序时会自动摘掉图标，不留「幽灵图标」；资源管理器重启后图标也会自动补回。
+When hidden, a tray icon remains at the bottom-right of the taskbar: left-click to restore the window, right-click for
+"Show window / Quit". On a new message or file request the icon shows a red dot, the hover tooltip carries the unread
+count, and a system notification pops when not in the foreground. The icon is removed cleanly on exit (no ghost icon),
+and is restored automatically after Explorer restarts.
 
-**② 完全无界面**：适合服务器、开机自启、不想留窗口的机器。
+**② Fully headless**: for servers, auto-start, and machines where you don't want a window.
 
 ```bash
-feigecraft serve                                   # 前台跑，Ctrl+C 退出
-feigecraft serve --alias 家庭NAS --dir D:\收件 --port 53317
+feigecraft serve                                   # foreground, Ctrl+C to quit
+feigecraft serve --alias home-nas --dir /data/incoming --port 53317
 ```
 
-`serve` 默认自动接受所有文件；加 `--ask` 改成每个请求都在终端问一句。
-端口被占用时（比如窗口版已经开着）会自动顺延，不会启动失败。
+`serve` auto-accepts all files by default; add `--ask` to prompt for each request in the terminal.
+If the port is taken (e.g. the GUI is already running) it shifts to the next available port rather than failing.
 
-开机自启注册的是 `feigecraft.exe --background`：开机后进程在后台跑、窗口不露面，
-点图标才进前台。
+Auto-start registers `feigecraft.exe --background`: the process runs in the background at boot without showing the
+window; click the icon to bring up the UI.
 
-### 同一台机器开多个实例（自己跟自己测）
+### Multiple instances on one machine (testing against yourself)
 
-默认情况下**同一时刻只有一个窗口**：再运行一次程序只会把已经开着的窗口叫到前台
-（这也是「关闭后还能回来」的实现方式）。真要开第二个，加 `--new` 或 `--instance 2`：
+By default there is **only one window at a time**: running the program again just brings the existing window to the
+front (this is also how "return after close" works). To actually open a second one, add `--new` or `--instance 2`:
 
 ```bash
-./target/release/feigecraft.exe                  # 第一个：主实例，端口 53317
-./target/release/feigecraft.exe --new            # 第二个：自动变成「实例 2」，端口 53318
-./target/release/feigecraft.exe --instance 3     # 指定编号
+./target/release/feigecraft.exe                  # first: primary instance, port 53317
+./target/release/feigecraft.exe --new            # second: becomes "instance 2", port 53318
+./target/release/feigecraft.exe --instance 3     # specify the number
 ```
 
-第二个进程会在启动时发现「实例 1 的编号已被占用」，于是自动：
+The second process detects on startup that "instance 1's number is taken", so it automatically:
 
-- 换一个实例编号，把配置目录挪到 `<配置目录>/instance-N`（证书、聊天记录、备注互不干扰，因此**指纹不同**，双方能互相看见对方是另一台设备）；
-- 用户名自动加后缀（如 `安静的柠檬-1`），下载目录也带上实例后缀，避免同名文件互相覆盖；
-- 监听端口直接定为 `53317 + N`（实例 2 用 53318、实例 3 用 53319），不再和 0 号实例抢 53317，
-  广播出去的 `info.port` 也同步改成自己的端口，对方连的就一定是这个实例。0 号实例保持 53317，不影响 LocalSend 互操作。
+- picks a new instance number and moves the config dir to `<config-dir>/instance-N` (certificates, chat history, and
+  nicknames are independent, so **fingerprints differ** and each side sees the other as a separate device);
+- appends a suffix to the username (e.g. `Quiet Kite-1`) and suffixes the download dir, avoiding name collisions;
+- sets the listening port to `53317 + N` (instance 2 uses 53318, instance 3 uses 53319), no longer competing for 53317,
+  and broadcasts the updated `info.port`, so peers always connect to this instance. Instance 0 keeps 53317, preserving
+  LocalSend interop.
 
-也可以显式指定：
+You can also specify explicitly:
 
 ```bash
-./target/release/feigecraft.exe --instance 3 --alias 测试机 --port 53400
+./target/release/feigecraft.exe --instance 3 --alias test --port 53400
 ./target/release/feigecraft.exe --config-dir ./portable-b
 ```
 
-实例编号靠「占住 `127.0.0.1:53300+N` 这个本地端口」来互斥，进程退出即释放，不会留下锁文件。
+The instance number is locked by holding the local port `127.0.0.1:53300+N`, released on exit — no lock file is left behind.
 
-### 图形界面怎么用
+### Using the GUI
 
-1. 打开后左栏会自动出现同网段设备（对方需打开 LocalSend 或 FeigeCraft），无需加好友。
-2. 点会话 → 底部输入框打字，回车发送；点笑脸选表情；`Shift + Enter` 换行。
-3. 点 📎 或把文件拖进窗口 → 生成文件气泡发送，对方收到「接受 / 拒绝」卡片。
-4. 会话右上角「⋯」可改备注（只存本机）、复制对方 IP、清空聊天记录。
-5. 设置里可改用户名、设备类型、保存目录、是否自动接受文件，以及**外观（跟随系统 / 浅色 / 深色）**。
+1. On launch, devices on the same subnet appear in the left column automatically (the peer needs LocalSend or FeigeCraft running), no friend requests needed.
+2. Click a conversation → type in the input box, Enter to send; click the smiley for emoji; `Shift + Enter` for a newline.
+3. Click 📎 or drag files into the window → a file bubble is sent; the peer sees an "Accept / Reject" card.
+4. The "⋯" at the top-right of a conversation lets you edit the nickname (local only), copy the peer's IP, or clear history.
+5. Settings lets you change the username, device type, save directory, auto-accept, and **appearance (follow-system / light / dark)**.
 
-## 与 LocalSend 的协议对应关系
+## Protocol mapping with LocalSend
 
-| 接口 | 方向 | 说明 |
+| Endpoint | Direction | Description |
 | --- | --- | --- |
-| `POST /api/localsend/v2/register` | 发送方 → 接收方 | 交换设备信息，返回别名与指纹 |
-| `POST /api/localsend/v2/prepare-upload` | 发送方 → 接收方 | 提交文件清单，接收方确认后返回 `sessionId` 与每个文件的 `token` |
-| `POST /api/localsend/v2/upload?sessionId=&fileId=&token=` | 发送方 → 接收方 | 裸流上传单个文件（同时兼容旧版 header 传参） |
-| `POST /api/localsend/v2/cancel?sessionId=` | 双方 | 取消会话 |
-| `GET /api/localsend/v2/info` | 任意 | 返回设备信息（子网扫描也用它） |
-| `POST /api/feigecraft/chat` | 双方 | **聊天扩展**（见下），LocalSend 会返回 404，此时文件功能不受影响 |
-| UDP 组播 `224.0.0.167:53317` | 双向 | JSON 广播设备信息，`announce=true` 表示主动广播 |
+| `POST /api/localsend/v2/register` | sender → receiver | exchange device info, returns alias and fingerprint |
+| `POST /api/localsend/v2/prepare-upload` | sender → receiver | submit the file list; receiver confirms and returns `sessionId` and a `token` per file |
+| `POST /api/localsend/v2/upload?sessionId=&fileId=&token=` | sender → receiver | raw-stream upload of a single file (also accepts the legacy header form) |
+| `POST /api/localsend/v2/cancel?sessionId=` | both | cancel the session |
+| `GET /api/localsend/v2/info` | any | returns device info (also used by subnet scanning) |
+| `POST /api/feigecraft/chat` | both | **chat extension** (see below); LocalSend returns 404, file transfer is unaffected |
+| UDP multicast `224.0.0.167:53317` | bidirectional | JSON device-info broadcast; `announce=true` means an active broadcast |
 
-### 聊天扩展协议
+### Chat extension protocol
 
-复用同一条 HTTPS 通道和同一套证书指纹校验，不额外开端口：
+Reuses the same HTTPS channel and certificate-fingerprint check — no extra port:
 
 ```jsonc
 POST /api/feigecraft/chat
 {
-  "info": { "alias": "我的电脑", "version": "2.1", "port": 53317,
+  "info": { "alias": "My PC", "version": "2.1", "port": 53317,
             "protocol": "https", "fingerprint": "…", "deviceModel": "windows" },
   "messages": [
-    { "id": "7a906db1-…", "text": "文件收到了，谢谢！", "at": 1793771855221 }
+    { "id": "7a906db1-…", "text": "Got it, thanks!", "at": 1793771855221 }
   ]
 }
 ```
 
-- 会话身份用**设备指纹**而不是别名（别名可以改、可以重名），所以改用户名不会丢聊天记录。
-- 消息**先本地落库再投递**：即使对方离线，消息也留在输入区上方的气泡里并标记「失败」，点一下可重发。
-- 对方是原版 LocalSend 时返回 404，界面提示「对方版本不支持聊天（仅支持收发文件）」，文件传输照常。
-- 每个会话最多保留 400 条消息（`MAX_MESSAGES_PER_PEER`），避免 `chats.json` 无限膨胀。
+- Conversation identity uses the **device fingerprint**, not the alias (aliases can change and collide), so renaming never loses history.
+- Messages are **persisted locally before delivery**: even if the peer is offline, the message stays in a bubble above the input with a "failed" mark, clickable to retry.
+- When the peer is stock LocalSend, it returns 404 and the UI shows "the peer doesn't support chat (file transfer only)" — file transfer still works.
+- Each conversation keeps at most 400 messages (`MAX_MESSAGES_PER_PEER`), so `chats.json` never grows unboundedly.
 
-实现细节：
+Implementation details:
 
-- 设备指纹 = 自签证书 DER 的 SHA-256，证书首次启动生成并持久化在配置目录，**重启后指纹不变**。
-- 客户端不使用系统根证书，而是**只信任对方广播出来的那个指纹**；指纹不匹配直接中断 TLS 握手。
-- 客户端强制 `no_proxy()`：局域网直连绝不能走系统代理，否则开了 VPN / 代理软件的用户会全部失败。
-- 上传时先落 `.part` 临时文件，成功后 `rename`，失败/取消则删除，不会留下半截文件。
-- 同名文件自动改名为 `name (1).ext`，文件名做了路径穿越与非法字符清洗。
-- 端口被占用（比如同时装了 LocalSend）时会自动顺延到下一个可用端口并广播新端口。
-- **发现用双套接字**：一个临时端口专门负责发广播（对方的回包会单播回到这个端口，保证一定能收到），
-  另一个尽力占住 53317 收别人主动发出的周期性广播。这样即使本机 53317 已被另一个 LocalSend 实例占用，
-  发现依然可用（Windows 上多进程重复绑定同一 UDP 端口时，组播包只会投递给其中一个进程）。
-- 启动 4 秒后若仍没发现任何设备，自动做一次本机子网 HTTP 扫描兜底（组播被交换机/AP 隔离时有用）。
+- The device fingerprint is the SHA-256 of the self-signed certificate's DER; the cert is generated and persisted on first launch, so the **fingerprint is stable across restarts**.
+- The client doesn't use the system root store — it **trusts only the fingerprint the peer broadcast**; a mismatch aborts the TLS handshake.
+- The client forces `no_proxy()`: LAN direct connections must never go through a system proxy, or users with a VPN/proxy would all fail.
+- Uploads write to a `.part` temp file first, then `rename` on success; on failure/cancel the partial file is removed.
+- Same-name files are renamed to `name (1).ext`; filenames are sanitized against path traversal and illegal characters.
+- When the port is taken (e.g. LocalSend is also installed) it shifts to the next available port and broadcasts the new one.
+- **Discovery uses dual sockets**: one ephemeral port is dedicated to sending broadcasts (peer replies come back unicast to this port, guaranteeing receipt), while another tries to hold 53317 to receive others' periodic broadcasts. So even if another LocalSend instance already holds 53317, discovery still works (on Windows, when multiple processes bind the same UDP port, multicast packets are delivered to only one of them).
+- If no device is found 4 seconds after launch, it automatically does a local-subnet HTTP scan as a fallback (useful when multicast is isolated by switches/APs).
 
-## 测试
+## Tests
 
 ```bash
-cargo test --workspace                    # 15 个单元测试 + 3 个端到端测试 + 1 个文档测试
-cargo clippy --workspace --all-targets    # 零警告
+cargo test --workspace                    # 15 unit tests + 3 end-to-end tests + 1 doc test
+cargo clippy --workspace --all-targets    # zero warnings
 ```
 
-端到端测试会在临时目录里起两个真实节点（一个发送端、一个接收端），走完整的
-`register → prepare-upload → upload` 流程并校验落盘内容；聊天用例则发一条真实消息，
-断言「发送端标记已送达 / 接收端收到事件并入库 / 会话归属到正确指纹 / 别名被记录」。
-不依赖外部服务。
+The end-to-end tests spin up two real nodes in a temp dir (one sender, one receiver), run the full
+`register → prepare-upload → upload` flow, and verify the on-disk contents; the chat case sends a real message and
+asserts "sender marks delivered / receiver emits an event and persists / the conversation is attributed to the right
+fingerprint / the alias is recorded". No external services required.
 
-## 配置与数据位置
+## Config and data locations
 
-| 平台 | 路径 |
+| Platform | Path |
 | --- | --- |
 | Windows | `%APPDATA%\FeigeCraft\` |
 | macOS | `~/Library/Application Support/FeigeCraft/` |
 | Linux | `~/.config/FeigeCraft/` |
 
-目录内包含：
+Contents:
 
-| 文件 | 内容 |
+| File | Purpose |
 | --- | --- |
-| `config.json` | 用户名（首次启动随机生成，可在设置里改）、设备类型、端口、下载目录、自动接受、**备注名表**、主题偏好（`theme`） |
-| `cert.der` / `key.der` | 自签证书与私钥（决定设备指纹） |
-| `chats.json` | 聊天记录（按对端指纹分组） |
+| `config.json` | username (random on first launch, editable in settings), device type, port, download dir, auto-accept, **nickname table**, theme preference (`theme`) |
+| `cert.der` / `key.der` | self-signed certificate and private key (determine the device fingerprint) |
+| `chats.json` | chat history (grouped by peer fingerprint) |
 
-多开时，第 2 个及以后的实例使用 `<配置目录>/instance-N/`，里面的结构与上表一致。
+With multiple instances, the 2nd and later instances use `<config-dir>/instance-N/` with the same structure.
 
-默认下载目录：系统下载目录下的 `FeigeCraft` 子目录（多开实例为 `FeigeCraft-N`），可在设置里修改。
+Default download dir: a `FeigeCraft` subdirectory of the system Downloads folder (`FeigeCraft-N` for extra instances), editable in settings.
 
-环境变量：
+Environment variables:
 
-| 变量 | 用途 |
+| Variable | Purpose |
 | --- | --- |
-| `FEIGECRAFT_CONFIG_DIR` | 指定配置目录（便携模式 / 多实例测试） |
-| `FEIGECRAFT_KEEP_CONSOLE` | 窗口模式也保留控制台，方便看日志 |
-| `FEIGECRAFT_FONT` | 指定中文字体文件 |
-| `FEIGECRAFT_LOG` | 日志级别（如 `debug`） |
-| `FEIGECRAFT_THEME` | 临时覆盖主题（`system` / `light` / `dark`），不影响已保存的偏好 |
-| `FEIGECRAFT_LANG` | 临时覆盖界面语言（`zh-CN` / `en`），不影响已保存的偏好 |
-| `FEIGECRAFT_SCREENSHOT` | 渲染一帧后存成 BMP 并退出（文档配图 / 回归验收用） |
-| `FEIGECRAFT_UI_DEMO` | 用假数据渲染界面（`1` / `incoming` / `settings` / `settings-identity` / `settings-transfer` / `settings-about` / `emoji` / `remark` / `connect` / `menu`），做截图与设计评审用 |
+| `FEIGECRAFT_CONFIG_DIR` | set the config dir (portable mode / multi-instance testing) |
+| `FEIGECRAFT_KEEP_CONSOLE` | keep the console in window mode, for reading logs |
+| `FEIGECRAFT_FONT` | specify a Chinese font file |
+| `FEIGECRAFT_LOG` | log level (e.g. `debug`) |
+| `FEIGECRAFT_THEME` | temporarily override the theme (`system` / `light` / `dark`), doesn't affect the saved preference |
+| `FEIGECRAFT_LANG` | temporarily override the UI language (`zh-CN` / `en`), doesn't affect the saved preference |
+| `FEIGECRAFT_SCREENSHOT` | render one frame, save as BMP, then exit (for docs / regression acceptance) |
+| `FEIGECRAFT_UI_DEMO` | render the UI with fake data (`1` / `incoming` / `settings` / `settings-identity` / `settings-transfer` / `settings-about` / `emoji` / `remark` / `connect` / `menu`), for screenshots and design review |
 
-## 跨平台构建
+## Cross-platform build
 
 ```bash
-cargo build --release            # 当前平台
-cargo build --release --target x86_64-pc-windows-gnu     # 交叉编译示例
+cargo build --release            # current platform
+cargo build --release --target x86_64-pc-windows-gnu     # cross-compile example
 ```
 
-- **Windows**：无需额外依赖（MSVC 或 GNU 工具链均可）。
-- **macOS**：`xcode-select --install`。
-- **Linux**：需要 X11/Wayland 开发库
+- **Windows**: no extra dependencies (MSVC or GNU toolchain both work).
+- **macOS**: `xcode-select --install`.
+- **Linux**: needs X11/Wayland dev libraries
   `sudo apt install libxkbcommon-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
-   libxcb-xfixes0-dev libssl-dev pkg-config`（文件选择框依赖 GTK）。
-- 中文字体：自动探测系统字体（`Deng.ttf` / `simhei.ttf` / Noto Sans SC 等），
-  也可用 `FEIGECRAFT_FONT=/path/to/font.ttf` 指定。
+   libxcb-xfixes0-dev libssl-dev pkg-config` (the file dialog depends on GTK).
+- Chinese fonts: auto-detected from the system (`Deng.ttf` / `simhei.ttf` / Noto Sans SC, etc.),
+  or set `FEIGECRAFT_FONT=/path/to/font.ttf`.
 
-### 防火墙
+### Firewall
 
-首次运行 Windows 会弹「允许访问网络」，请勾选**专用网络**。若没弹窗且搜不到设备，手动放行：
+On first run Windows pops "Allow access to the network" — check **Private networks**. If it doesn't appear and no devices
+are found, allow it manually:
 
 ```powershell
 New-NetFirewallRule -DisplayName "FeigeCraft" -Direction Inbound -Protocol TCP -LocalPort 53317 -Action Allow
 New-NetFirewallRule -DisplayName "FeigeCraft-UDP" -Direction Inbound -Protocol UDP -LocalPort 53317 -Action Allow
 ```
 
-Linux：`sudo ufw allow 53317/tcp && sudo ufw allow 53317/udp`。
+Linux: `sudo ufw allow 53317/tcp && sudo ufw allow 53317/udp`.
 
-多开实例（`53318`–`53324`）只用于本机自测，同机通信不走防火墙，不用额外放行；
-但如果要跨机器连到第 N 个实例，记得把对应的 TCP 端口也放行。
+Extra instances (`53318`–`53324`) are only for local self-testing; same-machine traffic doesn't traverse the firewall,
+so no extra rule is needed. To connect to the Nth instance across machines, allow the corresponding TCP port too.
 
-## 已知限制 / 后续可做
+## Known limitations / future work
 
-- 聊天不支持图片/语音消息内联预览（图片走文件通道，接收后在气泡里点开）。
-- 不做群聊：LocalSend 的发现模型是点对点，群聊需要额外的一台机器做转发。
-- 未实现 LocalSend v2.2 的可选 `sha256` 校验与文件预览缩略图（字段留空，对方仍可正常接收）。
-- 不支持断点续传（LocalSend 本身也不支持）。
-- 目录发送时会把子目录结构扁平化为 `目录_文件名`，避免与 LocalSend 的文件名语义冲突。
-- 组播在某些企业网络/访客 Wi-Fi 被隔离，且路由器通常不跨网段转发 224.0.0.167：
-  同网段靠每个接口各自的组播，跨网段用「手动连接」填 IP，或填 `192.168.2.0/24` 扫整段。
-- 接收端目前不做速率限制与黑名单（LocalSend 有 pin / 屏蔽功能，可按需扩展 `server.rs`）。
-- 安装包未做代码签名（需要自备证书），分发时 SmartScreen 会提示未知发布者。
+- Chat doesn't inline-preview image/voice messages (images go through the file channel; tap them in the bubble to open after receiving).
+- No group chat: LocalSend's discovery model is peer-to-peer; group chat would need an extra machine to relay.
+- Doesn't implement LocalSend v2.2's optional `sha256` check and file preview thumbnails (fields left empty; the peer still receives normally).
+- No resumable transfers (LocalSend doesn't support them either).
+- Sending a directory flattens subdirectory structure to `dir_filename`, avoiding conflicts with LocalSend's filename semantics.
+- Multicast is isolated on some enterprise networks / guest Wi-Fi, and routers generally don't forward 224.0.0.167 across subnets:
+  same-subnet works via each interface's multicast; cross-subnet use "Manual connect" with an IP, or scan a whole subnet with `192.168.2.0/24`.
+- The receiver currently has no rate limiting or blocklist (LocalSend has pin/block; could extend `server.rs` as needed).
+- The installer isn't code-signed (requires your own certificate); SmartScreen will show "unknown publisher" on distribution.
 
-## 许可
+## License
 
-MIT，全文见 [LICENSE](LICENSE)。协议设计来自 [LocalSend](https://github.com/localsend/localsend)（MIT/Apache-2.0），本项目为独立实现，代码与之无关。
+MIT — see [LICENSE](LICENSE). The protocol design is from [LocalSend](https://github.com/localsend/localsend)
+(MIT/Apache-2.0); this project is an independent implementation, its code unrelated to theirs.
 
-表情素材来自 [Twemoji](https://github.com/twitter/twemoji) 14.0.2，图形授权 **CC-BY 4.0**
-（Copyright 2020 Twitter, Inc and other contributors），
-详见 `crates/gui/assets/emoji/ATTRIBUTION.md`；重新获取用 `scripts/fetch-emoji.sh`。
+Emoji assets are from [Twemoji](https://github.com/twitter/twemoji) 14.0.2, licensed **CC-BY 4.0**
+(Copyright 2020 Twitter, Inc and other contributors), see `crates/gui/assets/emoji/ATTRIBUTION.md`;
+re-fetch with `scripts/fetch-emoji.sh`.
