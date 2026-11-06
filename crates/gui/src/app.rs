@@ -168,6 +168,63 @@ enum MsgAction {
     Copy(String),
     /// 双击打开文件本身（用系统默认应用）。
     OpenFile(PathBuf),
+    /// 右击菜单「删除」：从聊天记录里删掉这条消息；`also_file` 为真时连本地文件一起删。
+    Delete {
+        peer: String,
+        id: String,
+        path: Option<PathBuf>,
+        also_file: bool,
+    },
+}
+
+/// 输入框的固定 id。右键菜单的剪切/复制/粘贴/全选都要按它读写光标与选区状态。
+fn composer_id() -> egui::Id {
+    egui::Id::new("composer-text-edit")
+}
+
+/// 这个字符是否落在 emoji 区段里（用来决定要不要补装系统 emoji 字体）。
+/// 只收窄到真正会出现「彩色表情」的区段，避免把 → ↑ 这类常用箭头也算进来。
+fn is_emoji_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2600..=0x27BF      // ☀ ✂ ✅ ✨ ❤ 等杂项符号与 dingbats
+        | 0x2B00..=0x2BFF    // ⬛ ⬜ ⭐ ⭕ 等
+        | 0x2300..=0x23FF    // ⌚ ⏰ ⏳ 等
+        | 0x1F000..=0x1FAFF  // 绝大多数 emoji（含国旗、手势、表情）
+    )
+}
+
+/// 输入框右键菜单里的一次编辑动作。
+#[derive(Clone, Copy)]
+enum EditCmd {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+/// 画出右键菜单的一行（左对齐、悬停高亮、禁用变灰）。
+/// 返回是否被点击——只有可用项才会返回 true。
+fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+    let size = Vec2::new(ui.available_width(), 27.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = enabled && resp.hovered();
+    if hovered {
+        ui.painter().rect_filled(
+            rect,
+            egui::Rounding::same(theme::RADIUS_SM),
+            theme::card_hover(),
+        );
+    }
+    let color = if enabled { theme::text() } else { theme::faint() };
+    ui.painter().text(
+        rect.left_center() + Vec2::new(11.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        color,
+    );
+    enabled && resp.clicked()
 }
 
 pub struct FeigeCraftApp {
@@ -200,10 +257,21 @@ pub struct FeigeCraftApp {
     emojis: EmojiSet,
     /// 从剪贴板粘贴、尚未发送的图片（临时 PNG 路径）。点「发送」时随文字一起发出。
     pending_images: Vec<PathBuf>,
-    /// 上一帧 Ctrl（或 macOS 的 Cmd）是否处于按下状态。用于在 V 键「按下」事件被
-    /// egui 吞掉（Ctrl+V 会转成 Paste / 纯图片时被完全吞掉）的情况下，靠「松开」事件
-    /// 兜底识别粘贴意图。
-    ctrl_was_down: bool,
+    /// 待发送图片的缩略图纹理缓存（按路径索引）。只在内容变化时加载，避免每帧
+    /// 重复读盘 + 解码 + 上传 GPU，那是 CPU/内存占用高的主因之一。
+    paste_thumb_cache: HashMap<PathBuf, egui::TextureHandle>,
+    /// 输入框右键菜单的弹出位置。自己维护、用 Area 弹，不走 `context_menu`
+    /// （后者会叠一层覆盖整块输入区的点击层，把表情等按钮全部吃掉）。
+    paste_menu: Option<egui::Pos2>,
+    /// 右键菜单是否本帧刚打开：跳过这一帧的「点外面关闭」判断。
+    paste_menu_fresh: bool,
+    /// 右键那一刻输入框里的选区（字符下标，已排序）。菜单一弹出来输入框就失焦，
+    /// 选区高亮会消失，所以要把当时的范围记下来，剪切/复制才有东西可操作。
+    paste_menu_sel: Option<(usize, usize)>,
+    /// 系统 emoji 兜底字体是否已按需装上（它要 12 MB 字体文件 + 图集，启动时先不装）。
+    emoji_font_ready: bool,
+    /// 扫描「正文里有没有表情集之外的表情」的节流计数（每 60 帧扫一次）。
+    emoji_scan_tick: u32,
 
     settings_open: bool,
     settings_tab: SettingsTab,
@@ -321,7 +389,12 @@ impl FeigeCraftApp {
             emoji_anchor: Rect::NOTHING,
             emojis: EmojiSet::load(ctx),
             pending_images: Vec::new(),
-            ctrl_was_down: false,
+            paste_thumb_cache: HashMap::new(),
+            paste_menu: None,
+            paste_menu_fresh: false,
+            paste_menu_sel: None,
+            emoji_font_ready: false,
+            emoji_scan_tick: 0,
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
             remark_target: None,
@@ -389,11 +462,14 @@ impl FeigeCraftApp {
 
     // ------------------------------------------------------------ 数据辅助
 
+    /// 借用版本：标题栏每帧都要查一次，没必要为了看一眼复制整个结构体。
+    fn device_ref(&self, peer: &str) -> Option<&DiscoveredDevice> {
+        self.devices.iter().find(|device| peer_key(&device.info) == peer)
+    }
+
+    /// owning 版本：发送任务要把它 move 进 async 块。
     fn device_by_peer(&self, peer: &str) -> Option<DiscoveredDevice> {
-        self.devices
-            .iter()
-            .find(|device| peer_key(&device.info) == peer)
-            .cloned()
+        self.device_ref(peer).cloned()
     }
 
     fn is_online(&self, peer: &str) -> bool {
@@ -473,6 +549,18 @@ impl FeigeCraftApp {
         if closed {
             self.events = None;
         }
+        self.prune_transfers();
+    }
+
+    /// 清掉早就结束的传输条目。
+    ///
+    /// `transfers` 里存着文件名、目录等字符串，一次会话来几条就多几条，之前从不清，
+    /// 用久了会一直堆。进度条只在 `Running` 时画，所以删掉结束的一批不影响界面。
+    fn prune_transfers(&mut self) {
+        const LINGER: Duration = Duration::from_secs(60);
+        self.transfers.retain(|_, state| {
+            state.status == RowStatus::Running || state.last_sample.elapsed() < LINGER
+        });
     }
 
     fn pump_tasks(&mut self) {
@@ -763,6 +851,7 @@ impl FeigeCraftApp {
         // 先把待发送的剪贴板图片发出去（走文件通道），再发文字。
         if has_images {
             let images = std::mem::take(&mut self.pending_images);
+            self.paste_thumb_cache.clear();
             self.send_paths(images);
         }
         if text.is_empty() {
@@ -1329,10 +1418,27 @@ impl FeigeCraftApp {
                     if let Some(text) = preview_text {
                         let color =
                             if pending_files.is_some() { theme::warn() } else { theme::muted() };
-                        ui.add(
-                            egui::Label::new(RichText::new(text).size(11.5).color(color))
-                                .truncate(),
-                        );
+                        // 预览里带表情时不能交给 `Label`：字体里的表情只能画成单色剪影，
+                        // 11.5pt 下就是一团黑块。这里自己排一行，表情贴彩图，超宽截断。
+                        if self.emojis.contains_any(&text) {
+                            let (line, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 15.0),
+                                Sense::hover(),
+                            );
+                            paint_rich_line(
+                                ui.painter(),
+                                line,
+                                &text,
+                                &FontId::proportional(11.5),
+                                color,
+                                &self.emojis,
+                            );
+                        } else {
+                            ui.add(
+                                egui::Label::new(RichText::new(text).size(11.5).color(color))
+                                    .truncate(),
+                            );
+                        }
                     }
                 });
             },
@@ -1405,8 +1511,7 @@ impl FeigeCraftApp {
     fn chat_header(&mut self, ui: &mut egui::Ui, peer: &str) {
         let name = self.display_name(peer);
         let online = self.is_online(peer);
-        let device = self.device_by_peer(peer);
-        let subtitle = match &device {
+        let subtitle = match self.device_ref(peer) {
             Some(device) => {
                 let kind = device.info.device_type.unwrap_or(DeviceType::Desktop);
                 let kind = i18n::device_label(kind);
@@ -1541,8 +1646,8 @@ impl FeigeCraftApp {
             self.remark_focus = true;
         }
         if copy_ip {
-            if let Some(device) = &device {
-                ui.output_mut(|out| out.copied_text = device.ip.to_string());
+            if let Some(ip) = self.device_ref(peer).map(|device| device.ip.to_string()) {
+                ui.output_mut(|out| out.copied_text = ip);
             }
         }
         if clear_chat {
@@ -1557,27 +1662,25 @@ impl FeigeCraftApp {
     }
 
     fn message_stream(&mut self, ui: &mut egui::Ui, peer: &str, viewport: f32) {
-        let messages = self.threads.get(peer).cloned().unwrap_or_default();
-        let transfers = self.transfers.clone();
+        // 这里刻意不克隆 messages / transfers：每帧整段克隆，在长会话里就是
+        // 几千次 String 分配，纯属白烧 CPU。字段拆开借，互不打架。
         let peer_name = self.display_name(peer);
-        let request = self
-            .incoming
-            .iter()
-            .find(|(_, request)| request.peer == peer)
-            .map(|(id, request)| {
-                (id.clone(), request.sender.clone(), request.files.clone(), request.total_bytes)
-            });
-
         let mut action: Option<MsgAction> = None;
         let mut decision: Option<bool> = None;
+        let mut pending_session: Option<String> = None;
+
+        let FeigeCraftApp { threads, transfers, emojis, incoming, bottom_pad, .. } = self;
+        let messages: &[ChatMessage] = threads.get(peer).map(Vec::as_slice).unwrap_or(&[]);
+        let transfers: &HashMap<String, TransferState> = transfers;
+        let request = incoming.iter().find(|(_, request)| request.peer == peer);
 
         let scroll = ScrollArea::vertical()
             .auto_shrink([false, false])
             .max_height(viewport)
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                if self.bottom_pad > 0.0 {
-                    ui.add_space(self.bottom_pad);
+                if *bottom_pad > 0.0 {
+                    ui.add_space(*bottom_pad);
                 }
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
@@ -1591,7 +1694,7 @@ impl FeigeCraftApp {
 
                 let mut last_day = String::new();
                 let mut previous: Option<&ChatMessage> = None;
-                for message in &messages {
+                for message in messages {
                     let day = widgets::day_label(message.at);
                     if day != last_day {
                         day_separator(ui, &day);
@@ -1612,25 +1715,22 @@ impl FeigeCraftApp {
                         None => false,
                     };
                     ui.add_space(if grouped { 5.0 } else { 13.0 });
-                    let transfer =
-                        message.session_id.as_ref().and_then(|id| transfers.get(id)).cloned();
-                    if let Some(found) = message_bubble(
-                        ui,
-                        message,
-                        transfer.as_ref(),
-                        &peer_name,
-                        &self.emojis,
-                        !grouped,
-                    ) {
+                    let transfer = message.session_id.as_ref().and_then(|id| transfers.get(id));
+                    if let Some(found) =
+                        message_bubble(ui, message, transfer, &peer_name, emojis, !grouped)
+                    {
                         action = Some(found);
                     }
                     previous = Some(message);
                 }
 
-                if let Some((_, sender, files, total)) = &request {
+                if let Some((id, request)) = request {
                     ui.add_space(6.0);
-                    if let Some(value) = incoming_card(ui, sender, files, *total) {
+                    if let Some(value) =
+                        incoming_card(ui, &request.sender, &request.files, request.total_bytes)
+                    {
                         decision = Some(value);
+                        pending_session = Some(id.clone());
                     }
                     ui.add_space(6.0);
                 }
@@ -1639,10 +1739,10 @@ impl FeigeCraftApp {
 
         // 内容不足一屏时贴底显示，和聊天软件一致。
         // content_size 含已应用的 padding，减掉后才是真实内容高度。
-        let content_true = scroll.content_size.y - self.bottom_pad;
-        self.bottom_pad = (scroll.inner_rect.height() - content_true - 2.0).max(0.0);
+        let content_true = scroll.content_size.y - *bottom_pad;
+        *bottom_pad = (scroll.inner_rect.height() - content_true - 2.0).max(0.0);
 
-        if let (Some(value), Some((session_id, _, _, _))) = (decision, request) {
+        if let (Some(value), Some(session_id)) = (decision, pending_session) {
             self.respond_incoming(&session_id, value);
         }
         match action {
@@ -1664,19 +1764,64 @@ impl FeigeCraftApp {
                 ui.output_mut(|out| out.copied_text = text);
                 self.toast(tr("已复制"), false);
             }
+            Some(MsgAction::Delete {
+                peer,
+                id,
+                path,
+                also_file,
+            }) => {
+                self.delete_message(&peer, &id, path.as_deref(), also_file);
+            }
             None => {}
         }
+    }
+
+    /// 删除一条聊天消息；`also_file` 为真时把磁盘上的文件也删掉。
+    fn delete_message(
+        &mut self,
+        peer: &str,
+        id: &str,
+        path: Option<&std::path::Path>,
+        also_file: bool,
+    ) {
+        if let Some(node) = &self.node {
+            node.state.chats.remove_message(peer, id);
+        }
+        self.reload_thread(peer);
+        if also_file {
+            if let Some(path) = path {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        self.toast(tr("已删除消息和本地文件"), false);
+                    }
+                    Err(err) => {
+                        self.toast(
+                            tf(tr("消息已删除，但文件删除失败：{}"), &[&err.to_string()]),
+                            true,
+                        );
+                    }
+                }
+                return;
+            }
+        }
+        self.toast(tr("已删除该消息"), false);
     }
 
     fn composer_area(&mut self, ui: &mut egui::Ui, peer: &str) {
         let online = self.is_online(peer);
         let mut pick = false;
+        let mut paste_to_pending = false;
         // 聚焦时描边变强调色：这是聊天软件里最基本的「我在输入」反馈。
         let stroke = if self.composer_focused {
             Stroke::new(1.4_f32, theme::accent())
         } else {
             Stroke::new(1.0_f32, theme::border())
         };
+        // 注意：这里绝不能给 Frame 的 response 挂 `context_menu`，也不要叠一层
+        // 覆盖整块区域的 `ui.interact`。egui 的 `context_menu` 内部会执行
+        // `response.interact(Sense::click())`，等于在整块输入区**最后**注册一个
+        // 可点击层，命中测试里它会盖在表情 / 加号 / 剪贴板按钮和缩略图 × 之上，
+        // 导致这些控件全部点不动。右键菜单改为自己用 Area 弹（见 paste_menu_popup）。
         egui::Frame::none()
             .fill(theme::field())
             .rounding(egui::Rounding::same(theme::RADIUS_LG))
@@ -1686,54 +1831,64 @@ impl FeigeCraftApp {
                 // 待发送的剪贴板图片预览：横向一排缩略图，右上角 × 移除。
                 if !self.pending_images.is_empty() {
                     let mut remove: Option<usize> = None;
+                    let mut clear_all = false;
                     ui.horizontal_wrapped(|ui| {
                         let thumb = 72.0;
                         for (index, path) in self.pending_images.iter().enumerate() {
-                            let bytes = std::fs::read(path).unwrap_or_default();
-                            let img = image::load_from_memory(&bytes)
-                                .ok()
-                                .map(|im| im.to_rgba8());
-                            let (w, h) = img
-                                .as_ref()
-                                .map(|im| im.dimensions())
-                                .unwrap_or((1, 1));
-                            let color_img = img.map(|im| {
-                                egui::ColorImage::from_rgba_unmultiplied(
-                                    [w as usize, h as usize],
-                                    &im,
-                                )
-                            });
-                            let texture = color_img.map(|ci| {
-                                ui.ctx().load_texture(
-                                    format!("paste-{index}"),
-                                    ci,
-                                    egui::TextureOptions::LINEAR,
-                                )
-                            });
+                            // 纹理缓存：只在第一次遇到这个路径时读盘 + 解码 + 上传。
+                            // 避免每帧重复做这些昂贵操作（CPU/内存占用高的主因）。
+                            let cached = self.paste_thumb_cache.get(path).cloned();
+                            let texture = if let Some(tex) = cached {
+                                Some(tex)
+                            } else {
+                                // 只按「缩略图实际显示尺寸」解码后就缩小，**不要**把原图整张
+                                // 传成贴图：一张 4K 截图是 3840×2160×4 ≈ 33 MB 显存/内存，
+                                // 而缩略图格只有 72pt（2 倍屏 144px）。这里缩到 160px 见方，
+                                // 单张从几十 MB 降到 0.1 MB——粘贴截图后内存暴涨就是它造成的。
+                                let loaded = std::fs::read(path).ok().and_then(|bytes| {
+                                    image::load_from_memory(&bytes).ok().map(|im| {
+                                        let thumb = im.thumbnail(160, 160).to_rgba8();
+                                        drop(im);
+                                        thumb
+                                    })
+                                });
+                                let handle = loaded.map(|rgba| {
+                                    let (w, h) = rgba.dimensions();
+                                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                        [w as usize, h as usize],
+                                        &rgba,
+                                    );
+                                    // 纹理 id 用路径而不是下标：删掉中间一张后下标会整体前移，
+                                    // 用下标当 id 会让 egui 复用到上一张的旧纹理（串图）。
+                                    ui.ctx().load_texture(
+                                        format!("paste-thumb-{}", path.display()),
+                                        ci,
+                                        egui::TextureOptions::LINEAR,
+                                    )
+                                });
+                                if let Some(h) = handle.clone() {
+                                    self.paste_thumb_cache.insert(path.clone(), h);
+                                }
+                                handle
+                            };
 
-                            let (thumb_rect, _resp) =
-                                ui.allocate_exact_size(Vec2::splat(thumb), Sense::hover());
+                            let (thumb_rect, thumb_resp) =
+                                ui.allocate_exact_size(Vec2::splat(thumb), Sense::click());
                             let painter = ui.painter();
                             if let Some(texture) = &texture {
+                                let size = texture.size_vec2();
                                 let fit = egui::Rect::from_min_max(
                                     thumb_rect.min + Vec2::splat(3.0),
                                     thumb_rect.max - Vec2::splat(3.0),
                                 );
-                                // 保持比例、居中裁切填充
-                                let scale = (fit.width() / w as f32)
-                                    .max(fit.height() / h as f32);
-                                let src_w = fit.width() / scale / w as f32;
-                                let src_h = fit.height() / scale / h as f32;
+                                let scale = (fit.width() / size.x).max(fit.height() / size.y);
+                                let src_w = fit.width() / scale / size.x;
+                                let src_h = fit.height() / scale / size.y;
                                 let uv = egui::Rect::from_min_max(
                                     egui::pos2((1.0 - src_w) * 0.5, (1.0 - src_h) * 0.5),
                                     egui::pos2((1.0 + src_w) * 0.5, (1.0 + src_h) * 0.5),
                                 );
-                                painter.image(
-                                    texture.id(),
-                                    fit,
-                                    uv,
-                                    Color32::WHITE,
-                                );
+                                painter.image(texture.id(), fit, uv, Color32::WHITE);
                             } else {
                                 painter.rect_filled(
                                     thumb_rect,
@@ -1746,44 +1901,125 @@ impl FeigeCraftApp {
                                 egui::Rounding::same(theme::RADIUS_MD),
                                 Stroke::new(1.0_f32, theme::border()),
                             );
-                            // 右上角移除按钮
+                            // 右上角移除按钮：命中区 22×22，比画出来的圆大一圈更好点。
                             let close_center = thumb_rect.right_top() + Vec2::new(-8.0, 8.0);
-                            let close_rect = egui::Rect::from_center_size(
-                                close_center,
-                                Vec2::splat(18.0),
-                            );
+                            let close_rect =
+                                egui::Rect::from_center_size(close_center, Vec2::splat(22.0));
+                            // id 用路径而不是下标：删掉中间一张后其余下标会整体前移，
+                            // 用下标当 id 会让命中错位，表现就是「点了没反应」。
                             let close_resp = ui.interact(
                                 close_rect,
-                                ui.id().with(("paste-close", index)),
+                                egui::Id::new(("paste-close", path.as_os_str())),
                                 Sense::click(),
                             );
-                            painter.circle_filled(close_center, 9.0, Color32::from_black_alpha(180));
+                            let close_hot = close_resp.hovered();
+                            painter.circle_filled(
+                                close_center,
+                                if close_hot { 10.0 } else { 9.0 },
+                                if close_hot {
+                                    theme::err()
+                                } else {
+                                    Color32::from_black_alpha(200)
+                                },
+                            );
                             painter.line_segment(
                                 [
                                     close_center + Vec2::new(-3.5, -3.5),
                                     close_center + Vec2::new(3.5, 3.5),
                                 ],
-                                Stroke::new(1.6_f32, Color32::WHITE),
+                                Stroke::new(1.8_f32, Color32::WHITE),
                             );
                             painter.line_segment(
                                 [
                                     close_center + Vec2::new(3.5, -3.5),
                                     close_center + Vec2::new(-3.5, 3.5),
                                 ],
-                                Stroke::new(1.6_f32, Color32::WHITE),
+                                Stroke::new(1.8_f32, Color32::WHITE),
                             );
                             if close_resp.clicked() {
                                 remove = Some(index);
                             }
+                            let _ = close_resp.on_hover_text(tr("移除"));
+                            // 右键缩略图也能移除：叉太小点不到时的第二条路。
+                            if thumb_resp.secondary_clicked() {
+                                remove = Some(index);
+                            }
+                            let _ = thumb_resp.on_hover_text(tr("右键移除这张"));
+                        }
+                        // 一次清空的兜底，免得一张张点。
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(tr("清空")).size(11.5).color(theme::muted()),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, theme::border()))
+                                .rounding(egui::Rounding::same(theme::RADIUS_SM))
+                                .min_size(Vec2::new(44.0, 24.0)),
+                            )
+                            .clicked()
+                        {
+                            clear_all = true;
                         }
                     });
                     if let Some(index) = remove {
+                        if let Some(path) = self.pending_images.get(index).cloned() {
+                            self.paste_thumb_cache.remove(&path);
+                        }
                         self.pending_images.remove(index);
+                    }
+                    if clear_all {
+                        for path in self.pending_images.drain(..) {
+                            self.paste_thumb_cache.remove(&path);
+                        }
                     }
                     ui.add_space(8.0);
                 }
                 // 三行起步：一行太窄，写两句话就得上下滚，是之前最别扭的一点。
+                //
+                // 表情为什么要自定义 layouter：egui 走 ab_glyph，画不了彩色字体。
+                // 系统 `seguiemj.ttf` 是 COLR/CPAL 彩色字体，落到 ab_glyph 里只剩轮廓层，
+                // 于是输入框（以及任何走字体的地方）里的表情都是**一团黑剪影**。
+                // 表情面板和气泡早就改成贴 Twemoji 贴图了，这里补上输入框：
+                // 把表情字符的颜色设成全透明（占位宽度照旧，光标/换行不受影响），
+                // 再在同一格位置上盖一张彩色贴图，观感就和气泡里一致了。
+                let emojis = &self.emojis;
+                let body_font = FontId::proportional(14.5);
+                let mut layouter =
+                    |ui: &egui::Ui, text: &str, wrap_width: f32| -> Arc<egui::Galley> {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.wrap.max_width = wrap_width;
+                        let format = |is_emoji: bool| egui::text::TextFormat {
+                            font_id: body_font.clone(),
+                            color: if is_emoji {
+                                Color32::TRANSPARENT
+                            } else {
+                                theme::text()
+                            },
+                            ..Default::default()
+                        };
+                        // 按「表情 / 非表情」切段，段数远少于逐字一段。
+                        let mut run = String::new();
+                        let mut run_emoji: Option<bool> = None;
+                        for ch in text.chars() {
+                            let is_emoji = emojis.index_of(ch).is_some();
+                            if run_emoji != Some(is_emoji) {
+                                if let Some(prev) = run_emoji {
+                                    job.append(&run, 0.0, format(prev));
+                                    run.clear();
+                                }
+                                run_emoji = Some(is_emoji);
+                            }
+                            run.push(ch);
+                        }
+                        if let Some(prev) = run_emoji {
+                            job.append(&run, 0.0, format(prev));
+                        }
+                        ui.fonts(|fonts| fonts.layout_job(job))
+                    };
                 let text_edit = egui::TextEdit::multiline(&mut self.composer)
+                    // 固定 id：右键菜单里的剪切/复制/粘贴/全选要按这个 id 读写光标状态。
+                    .id(composer_id())
                     .hint_text(
                         RichText::new(if online {
                             tr("发消息…（Enter 发送，Shift+Enter 换行）")
@@ -1797,9 +2033,53 @@ impl FeigeCraftApp {
                     .desired_width(f32::INFINITY)
                     .frame(false)
                     .margin(egui::Margin::symmetric(0.0, 2.0))
-                    .font(FontId::proportional(14.5));
-                let response = ui.add(text_edit);
+                    .font(body_font.clone())
+                    .layouter(&mut layouter);
+                let output = text_edit.show(ui);
+                let response = output.response.clone();
                 self.composer_focused = response.has_focus();
+                // 透明占位的表情格上贴彩色贴图（裁剪到文本可视区，滚动时不会溢出）。
+                // `glyph.pos` 是相对整个 galley 的基线坐标（已含行偏移，探针实测过），
+                // 纵向按 row.rect 取整行高，贴图才能在行内居中。
+                {
+                    let painter = ui.painter_at(output.text_clip_rect);
+                    for row in &output.galley.rows {
+                        for glyph in &row.glyphs {
+                            let Some(index) = self.emojis.index_of(glyph.chr) else {
+                                continue;
+                            };
+                            let Some(item) = self.emojis.get(index) else {
+                                continue;
+                            };
+                            let cell = Rect::from_min_size(
+                                pos2(
+                                    output.galley_pos.x + glyph.pos.x,
+                                    output.galley_pos.y + row.rect.min.y,
+                                ),
+                                Vec2::new(glyph.advance_width, row.rect.height()),
+                            );
+                            let size = cell.width().min(cell.height());
+                            emoji::paint(&painter, cell, &item.texture, size);
+                        }
+                    }
+                }
+                // 右键弹标准编辑菜单（剪切 / 复制 / 粘贴 / 全选）。这里不用
+                // `response.context_menu`：它内部会执行 `response.interact(Sense::click())`，
+                // 在文本区之上再叠一个点击层，命中测试里把同一块 Frame 里的表情 / 加号 /
+                // 剪贴板按钮一起挡住。改成自己记一个坐标、用 Area 弹，零覆盖、零副作用。
+                if response.secondary_clicked() {
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        self.paste_menu = Some(pos);
+                        self.paste_menu_fresh = true;
+                        // 记下此刻的选区：菜单一弹出输入框就失焦，高亮没了，
+                        // 但剪切/复制仍要对「右键前选中的那段」生效。
+                        self.paste_menu_sel = output.cursor_range.map(|range| {
+                            let [a, b] = range.as_ccursor_range().sorted();
+                            let total = self.composer.chars().count();
+                            (a.index.min(total), b.index.min(total))
+                        });
+                    }
+                }
                 let enter =
                     ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift);
                 if enter && response.has_focus() {
@@ -1819,6 +2099,9 @@ impl FeigeCraftApp {
                     if widgets::icon_button(ui, widgets::Icon::Plus, tr("发送文件")).clicked() {
                         pick = true;
                     }
+                    if widgets::icon_button(ui, widgets::Icon::Clipboard, tr("粘贴图片/文件")).clicked() {
+                        paste_to_pending = true;
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let ready =
                             !self.composer.trim().is_empty() || !self.pending_images.is_empty();
@@ -1837,6 +2120,10 @@ impl FeigeCraftApp {
                     });
                 });
             });
+        // 统一处理「粘贴图片/文件」：右键菜单、粘贴按钮、Ctrl+V 都会设置此标志。
+        if paste_to_pending {
+            self.paste_assets_to_pending();
+        }
         if pick {
             self.pick_files();
         }
@@ -2030,6 +2317,7 @@ impl FeigeCraftApp {
     fn windows(&mut self, ctx: &egui::Context) {
         // 表情浮层先画：弹窗打开时应该盖住它。
         self.emoji_popup(ctx);
+        self.paste_menu_popup(ctx);
         self.settings_modal(ctx);
         self.remark_window(ctx);
         self.connect_window(ctx);
@@ -2882,6 +3170,21 @@ impl FeigeCraftApp {
         self.select(&xiaomi);
         *self.unread.entry(mac).or_insert(0) = 2;
 
+        // 性能走查用：`FEIGECRAFT_DEMO_FILLER=2000` 往当前会话灌 N 条消息。
+        if let Ok(count) = std::env::var("FEIGECRAFT_DEMO_FILLER") {
+            if let (Ok(count), Some(node)) = (count.parse::<usize>(), &self.node) {
+                let now = feigecraft_core::chat::now_ms();
+                for index in 0..count {
+                    let text = format!("第 {index} 条压测消息，用来量长会话的每帧开销");
+                    let mut message = ChatMessage::text(&xiaomi, index % 2 == 1, text);
+                    message.at = now - ((count - index) as u64) * 1000;
+                    message.status = MessageStatus::Sent;
+                    node.state.chats.append(message);
+                }
+                self.reload_thread(&xiaomi);
+            }
+        }
+
         if mode.contains("emoji") {
             self.emoji_open = true;
         }
@@ -3477,6 +3780,15 @@ fn message_bubble(
             if ui.selectable_label(false, tr("复制")).clicked() {
                 action = Some(MsgAction::Copy(message.text.clone()));
             }
+            ui.separator();
+            if ui.selectable_label(false, tr("删除")).clicked() {
+                action = Some(MsgAction::Delete {
+                    peer: message.peer.clone(),
+                    id: message.id.clone(),
+                    path: None,
+                    also_file: false,
+                });
+            }
         });
     } else if let Some((indices, per_row)) = emoji_run {
         const GAP: f32 = 4.0;
@@ -3657,6 +3969,27 @@ fn message_bubble(
                     }
                 }
             }
+            ui.separator();
+            if ui.selectable_label(false, tr("删除")).clicked() {
+                action = Some(MsgAction::Delete {
+                    peer: message.peer.clone(),
+                    id: message.id.clone(),
+                    path: file_path.clone(),
+                    also_file: false,
+                });
+            }
+            if file_path.is_some()
+                && ui
+                    .selectable_label(false, tr("删除并移除本地文件"))
+                    .clicked()
+            {
+                action = Some(MsgAction::Delete {
+                    peer: message.peer.clone(),
+                    id: message.id.clone(),
+                    path: file_path.clone(),
+                    also_file: true,
+                });
+            }
         });
 
         // 双击：直接打开文件本身（用系统默认应用）。
@@ -3816,6 +4149,108 @@ fn layout_inline(
     }
 }
 
+/// 单行「文字 + 表情」绘制：给会话列表的最新消息预览这种高度锁死、不能换行的地方用。
+///
+/// 为什么不直接用 `Label`：epaint 走 ab_glyph，表情落进字体里只有单色轮廓，
+/// 字号一小就是一团黑块。这里表情贴彩色贴图，超宽按字截断补省略号。
+fn paint_rich_line(
+    painter: &egui::Painter,
+    rect: Rect,
+    text: &str,
+    font: &FontId,
+    color: Color32,
+    emojis: &EmojiSet,
+) {
+    let row_h = painter.layout_no_wrap("国".to_owned(), font.clone(), color).size().y;
+    let emoji_size = row_h.max(font.size * 1.2);
+    let dot = painter.layout_no_wrap("…".to_owned(), font.clone(), color);
+
+    // 先把每个字/表情的位置量出来：预览最多几十个字，逐字测宽的开销可以忽略。
+    let mut items: Vec<(f32, InlineSegment, f32)> = Vec::new();
+    let mut x = 0.0_f32;
+    let mut truncated = false;
+    for ch in text.chars() {
+        // 变体选择符、零宽连接符和空白不占位置。
+        if matches!(ch, '\u{fe0f}' | '\u{200d}' | '\n' | '\r' | '\t') {
+            continue;
+        }
+        let (segment, advance) = match emojis.index_of(ch) {
+            Some(index) => (InlineSegment::Emoji(index), emoji_size),
+            None => {
+                let width = painter.layout_no_wrap(ch.to_string(), font.clone(), color).size().x;
+                if is_emoji_like(ch) {
+                    // 贴图集之外的表情：交给系统字体兜底，但仍按表情边长留位。
+                    let width = width.max(emoji_size);
+                    (InlineSegment::System(ch, width), width)
+                } else {
+                    (InlineSegment::Text(ch.to_string()), width)
+                }
+            }
+        };
+        if x + advance > rect.width() && !items.is_empty() {
+            truncated = true;
+            break;
+        }
+        items.push((x, segment, advance));
+        x += advance;
+    }
+    // 截断了就得给省略号腾地方：从尾巴里一个字一个字往回收。
+    if truncated {
+        while let Some((_, _, advance)) = items.last() {
+            if x + dot.size().x <= rect.width() {
+                break;
+            }
+            x -= advance;
+            items.pop();
+        }
+    }
+
+    let mid_y = rect.center().y;
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i].1 {
+            InlineSegment::Text(_) => {
+                // 连着的中文并成一段画，逐字画字距会散。
+                let start = items[i].0;
+                let mut run = String::new();
+                while let Some((_, InlineSegment::Text(ch), _)) = items.get(i) {
+                    run.push_str(ch);
+                    i += 1;
+                }
+                let galley = painter.layout_no_wrap(run, font.clone(), color);
+                painter.galley(
+                    pos2(rect.left() + start, mid_y - galley.size().y * 0.5),
+                    galley,
+                    color,
+                );
+            }
+            InlineSegment::Emoji(index) => {
+                if let Some(item) = emojis.get(*index) {
+                    let cell = Rect::from_min_size(
+                        pos2(rect.left() + items[i].0, mid_y - emoji_size * 0.5),
+                        Vec2::splat(emoji_size),
+                    );
+                    emoji::paint(painter, cell, &item.texture, emoji_size);
+                }
+                i += 1;
+            }
+            InlineSegment::System(ch, width) => {
+                painter.text(
+                    pos2(rect.left() + items[i].0 + width * 0.5, mid_y),
+                    egui::Align2::CENTER_CENTER,
+                    *ch,
+                    font.clone(),
+                    color,
+                );
+                i += 1;
+            }
+        }
+    }
+    if truncated {
+        painter.galley(pos2(rect.left() + x, mid_y - dot.size().y * 0.5), dot, color);
+    }
+}
+
 /// 收到文件请求时的内联卡片（替代打断式弹窗）。
 /// 返回 `Some(true)` 表示接受、`Some(false)` 表示拒绝。
 fn incoming_card(
@@ -3888,6 +4323,9 @@ fn incoming_card(
 
 impl eframe::App for FeigeCraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let probe_start = std::time::Instant::now();
+        // 「今天」每帧只算一次，别让每条消息都去查一遍时区表。
+        widgets::begin_frame();
         // 「跟随系统」时主题可能被操作系统改掉，每帧同步一次调色板。
         theme::sync(ctx.theme());
 
@@ -3898,6 +4336,7 @@ impl eframe::App for FeigeCraftApp {
         self.pump_tasks();
         self.handle_dropped(ctx);
         self.paste_from_clipboard(ctx);
+        self.ensure_emoji_font(ctx);
 
         self.title_bar(ctx);
         self.sidebar(ctx);
@@ -3905,10 +4344,49 @@ impl eframe::App for FeigeCraftApp {
         self.windows(ctx);
         self.handle_screenshot(ctx);
 
-        ctx.request_repaint_after(Duration::from_millis(120));
+        // 按需重绘：有正在进行的传输时才持续刷新进度条；否则不主动请求重绘，
+        // 让 egui 进入省电状态（静止时不再每 120ms 空转，显著降低 CPU 占用）。
+        let has_running = self
+            .transfers
+            .values()
+            .any(|t| t.status == RowStatus::Running);
+        if has_running {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        // 性能诊断开关（`FEIGECRAFT_PERFLOG=1`）：每 2 秒打一行
+        // 「帧数 / 平均 update 耗时 / 进程 CPU」，用来定位「CPU 高」到底高在哪。
+        if std::env::var_os("FEIGECRAFT_PERFLOG").is_some() {
+            use std::sync::Mutex;
+            static STATE: Mutex<Option<(std::time::Instant, u32, f64, f64)>> = Mutex::new(None);
+            let cost = probe_start.elapsed().as_secs_f64() * 1000.0;
+            let cpu = process_cpu_seconds().unwrap_or(0.0);
+            let mut guard = STATE.lock().unwrap();
+            let state = guard.get_or_insert((std::time::Instant::now(), 0, 0.0, cpu));
+            state.1 += 1;
+            state.2 += cost;
+            let elapsed = state.0.elapsed().as_secs_f64();
+            if elapsed >= 2.0 {
+                tracing::info!(
+                    "perf: {} 帧 / {:.1}s = {:.1} fps，update 平均 {:.2} ms，进程 CPU {:.1}% (1 核)",
+                    state.1,
+                    elapsed,
+                    state.1 as f64 / elapsed,
+                    state.2 / state.1 as f64,
+                    (cpu - state.3) / elapsed * 100.0
+                );
+                *state = (std::time::Instant::now(), 0, 0.0, cpu);
+            }
+            // 强制连续重绘，量「正在交互时」的每帧成本。
+            ctx.request_repaint();
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 聊天记录是合并写的，退出前补一次，别把最后几百毫秒的消息丢了。
+        if let Some(node) = &self.node {
+            node.state.chats.flush();
+        }
         // 不摘掉的话，任务栏右下角会留一个点了没反应的「幽灵图标」。
         crate::tray::uninstall();
     }
@@ -4009,52 +4487,240 @@ impl FeigeCraftApp {
         }
     }
 
-    /// Ctrl+V 且输入框没聚焦时，把剪贴板里的图片 / 文件落到待发送列表。
-    /// 输入框聚焦时 Ctrl+V 是正常的文字粘贴，这里不拦截。
+    /// Ctrl+V 时，把剪贴板里的图片 / 文件落到待发送列表。
     ///
     /// 关键背景：egui-winit 会把 Ctrl+V 的「V 按下」事件吞掉，转成 `Event::Paste`
     /// （仅当剪贴板里有文本时），纯图片 / 纯文件时连 Paste 都不推。所以不能靠
-    /// `key_pressed(Key::V)` 检测粘贴，它永远为 false。这里改用两条可靠信号：
-    /// ① `Event::Paste`（剪贴板含文本）；② V 键的「松开」事件 + Ctrl 按住（V 的
-    /// 按下被吞、但松开会正常派发）。
+    /// `key_pressed(Key::V)` 检测粘贴，它永远为 false。
+    ///
+    /// 可靠信号：V 键的「松开」事件（按下被吞、但松开一定会派发成 `Event::Key`）。
+    /// 这里不依赖「松开时 Ctrl 是否还按着」——截图粘贴时用户常先松 Ctrl 再松 V，
+    /// 那一帧 `modifiers.command` 已为 false，强依赖 Ctrl 会漏判。
+    ///
+    /// 即使输入框聚焦也处理图片/文件粘贴：文字粘贴由 TextEdit 内置处理，但图片/
+    /// 文件必须由这里接管；`read_clipboard_assets` 对纯文字静默返回空，不会误触发。
     fn paste_from_clipboard(&mut self, ctx: &egui::Context) {
-        if self.active.is_none() {
-            return;
-        }
-        // 先读本帧输入，再更新 ctrl_was_down（用完之后再记，避免自读自写）。
-        let (paste_event, v_released, ctrl_down) = ctx.input(|input| {
+        let (paste_event, v_released) = ctx.input(|input| {
             let paste = input
                 .events
                 .iter()
                 .any(|e| matches!(e, egui::Event::Paste(_)));
-            let v_released = input.key_released(egui::Key::V);
-            (paste, v_released, input.modifiers.command)
+            (paste, input.key_released(egui::Key::V))
         });
-        let ctrl_held = ctrl_down || self.ctrl_was_down;
-        self.ctrl_was_down = ctrl_down;
 
-        if self.composer_focused {
+        if self.active.is_none() {
             return;
         }
-        // 有文本时 egui 会推 Paste；纯图片/纯文件时靠「V 松开 + Ctrl 按着」识别。
-        if !paste_event && !(v_released && ctrl_held) {
+        // 有文本时 egui 推 Paste；纯图片/纯文件时靠「V 松开」识别。
+        if !paste_event && !v_released {
             return;
         }
 
+        self.paste_assets_to_pending();
+    }
+
+    /// 正文里真的出现「表情集之外」的表情时，才补装系统 emoji 字体。
+    ///
+    /// 那套字体（Windows 上是 `seguiemj.ttf`）常驻内存约 35 MB：12 MB 字体文件本身
+    /// 加图集里固化的一堆单色字形。而应用里 60 个常用表情都是 Twemoji 贴图，根本
+    /// 不走字体，所以启动时不装；只有收到/输入了贴图集没有的表情（比如 🦄🍕）才装。
+    /// 每 60 帧（约 1 秒）才扫一次，静止时几乎没有开销。
+    fn ensure_emoji_font(&mut self, ctx: &egui::Context) {
+        if self.emoji_font_ready {
+            return;
+        }
+        self.emoji_scan_tick = self.emoji_scan_tick.wrapping_add(1);
+        if self.emoji_scan_tick % 60 != 1 {
+            return;
+        }
+        let need = {
+            let mut texts: Vec<&str> = vec![self.composer.as_str()];
+            if let Some(peer) = &self.active {
+                if let Some(messages) = self.threads.get(peer) {
+                    texts.extend(messages.iter().map(|message| message.text.as_str()));
+                }
+            }
+            texts
+                .iter()
+                .any(|text| text.chars().any(|ch| self.needs_font_emoji(ch)))
+        };
+        if need {
+            tracing::info!("正文里有表情贴图集之外的表情，补装系统 emoji 字体");
+            theme::install_fonts(ctx, true);
+            self.emoji_font_ready = true;
+        }
+    }
+
+    /// 这个字符是否需要系统 emoji 字体兜底（在表情区段内、且贴图集里没有）。
+    fn needs_font_emoji(&self, ch: char) -> bool {
+        is_emoji_char(ch) && self.emojis.index_of(ch).is_none()
+    }
+
+    /// 把剪贴板里的图片 / 文件追加到待发送列表（右键菜单、剪贴板按钮、Ctrl+V 共用）。
+    fn paste_assets_to_pending(&mut self) {        if self.active.is_none() {
+            self.toast(tr("先选一个设备再粘贴"), false);
+            return;
+        }
         match read_clipboard_assets() {
             Ok(assets) if !assets.is_empty() => {
-                for path in assets {
-                    self.pending_images.push(path);
-                }
+                self.pending_images.extend(assets);
                 self.toast(tr("已粘贴，点发送即可发出"), false);
             }
             Ok(_) => {
-                // 剪贴板里既没图片也没文件，忽略（纯文字，等用户点输入框再粘）。
+                // 剪贴板里既没图片也没文件，忽略（纯文字交给 TextEdit）。
+                self.toast(tr("剪贴板里没有可发送的图片或文件"), false);
             }
             Err(err) => {
                 self.toast(tf(tr("读取剪贴板失败：{}"), &[&err]), true);
             }
         }
+    }
+
+    /// 输入框右键菜单：标准的「剪切 / 复制 / 粘贴 / 全选」。
+    ///
+    /// 自己用 Area 弹，不用 `Response::context_menu`——后者内部会
+    /// `response.interact(Sense::click())`，在整块输入区上再叠一层点击层，
+    /// 把表情 / 加号 / 剪贴板按钮和缩略图 × 全部挡住（就是「按钮点不动」的根因）。
+    ///
+    /// 「粘贴」是智能的：剪贴板是文字就插进光标处；是截图 / 文件就走图片通道
+    /// 进待发送列表，所以原来那个「粘贴图片/文件」入口没有丢。
+    fn paste_menu_popup(&mut self, ctx: &egui::Context) {
+        let Some(pos) = self.paste_menu else {
+            self.paste_menu_fresh = false;
+            return;
+        };
+        let total = self.composer.chars().count();
+        let (sel_start, sel_end) = self
+            .paste_menu_sel
+            .map(|(a, b)| (a.min(total), b.min(total)))
+            .unwrap_or((total, total));
+        let has_selection = sel_end > sel_start;
+        let mut picked: Option<EditCmd> = None;
+        let area = egui::Area::new(egui::Id::new("paste-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+                    .show(ui, |ui| {
+                        // 固定宽度：不设上限的话，Area 会按整块屏幕的可用宽度撑开，
+                        // 菜单会变成横贯半屏的一条（Windows 原生菜单是窄条）。
+                        ui.set_min_width(126.0);
+                        ui.set_max_width(126.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                        if menu_row(ui, tr("剪切"), has_selection) {
+                            picked = Some(EditCmd::Cut);
+                        }
+                        if menu_row(ui, tr("复制"), has_selection) {
+                            picked = Some(EditCmd::Copy);
+                        }
+                        if menu_row(ui, tr("粘贴"), true) {
+                            picked = Some(EditCmd::Paste);
+                        }
+                        // 分隔线：和 Windows 原生菜单一致，动作组之间留一条细线。
+                        ui.add_space(4.0);
+                        let (line, _) =
+                            ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+                        ui.painter().hline(
+                            line.x_range(),
+                            line.center().y,
+                            Stroke::new(1.0_f32, theme::border()),
+                        );
+                        ui.add_space(4.0);
+                        if menu_row(ui, tr("全选"), !self.composer.is_empty()) {
+                            picked = Some(EditCmd::SelectAll);
+                        }
+                    });
+            });
+        let rect = area.response.rect;
+        let fresh = std::mem::take(&mut self.paste_menu_fresh);
+        // 点菜单外（或按 ESC）收起；刚弹出那一帧的右键本身不算「点外面」。
+        let clicked_outside = ctx.input(|input| {
+            input.key_pressed(egui::Key::Escape)
+                || (input.pointer.any_click()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| !rect.contains(pos)))
+        });
+        if let Some(cmd) = picked {
+            self.apply_edit_cmd(ctx, cmd, sel_start, sel_end);
+            self.paste_menu = None;
+            self.paste_menu_sel = None;
+        } else if clicked_outside && !fresh {
+            self.paste_menu = None;
+            self.paste_menu_sel = None;
+        }
+    }
+
+    /// 执行右键菜单里的编辑动作。光标状态按固定 id 读写，改完把焦点还回输入框，
+    /// 用户接着打字即可。
+    fn apply_edit_cmd(&mut self, ctx: &egui::Context, cmd: EditCmd, start: usize, end: usize) {
+        match cmd {
+            EditCmd::Copy => {
+                let sel = self.composer_slice(start, end);
+                if !sel.is_empty() {
+                    ctx.output_mut(|out| out.copied_text = sel);
+                    self.toast(tr("已复制"), false);
+                }
+            }
+            EditCmd::Cut => {
+                let sel = self.composer_slice(start, end);
+                if !sel.is_empty() {
+                    ctx.output_mut(|out| out.copied_text = sel);
+                    self.replace_composer(ctx, start, end, "");
+                    self.toast(tr("已剪切"), false);
+                }
+            }
+            EditCmd::Paste => {
+                // 文字优先插到光标处；剪贴板里没有文字时，再看是不是截图 / 文件。
+                let text = arboard::Clipboard::new()
+                    .ok()
+                    .and_then(|mut clipboard| clipboard.get_text().ok())
+                    .filter(|text| !text.is_empty());
+                match text {
+                    Some(text) => self.replace_composer(ctx, start, end, &text.replace("\r\n", "\n")),
+                    None => self.paste_assets_to_pending(),
+                }
+            }
+            EditCmd::SelectAll => {
+                let total = self.composer.chars().count();
+                let mut state = egui::TextEdit::load_state(ctx, composer_id()).unwrap_or_default();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(total),
+                )));
+                egui::TextEdit::store_state(ctx, composer_id(), state);
+                ctx.memory_mut(|memory| memory.request_focus(composer_id()));
+            }
+        }
+    }
+
+    /// 取输入框里 [start, end) 这段字符（下标按 char 算，避免中文被切坏）。
+    fn composer_slice(&self, start: usize, end: usize) -> String {
+        self.composer
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect()
+    }
+
+    /// 把 [start, end) 换成 `insert`，光标落到插入内容后面，并把焦点还给输入框。
+    fn replace_composer(&mut self, ctx: &egui::Context, start: usize, end: usize, insert: &str) {
+        let chars: Vec<char> = self.composer.chars().collect();
+        let end = end.min(chars.len());
+        let start = start.min(end);
+        let mut next: String = chars[..start].iter().collect();
+        next.push_str(insert);
+        next.extend(chars[end..].iter());
+        self.composer = next;
+        let caret = start + insert.chars().count();
+        let mut state = egui::TextEdit::load_state(ctx, composer_id()).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(caret))));
+        egui::TextEdit::store_state(ctx, composer_id(), state);
+        ctx.memory_mut(|memory| memory.request_focus(composer_id()));
     }
 }
 
@@ -4096,5 +4762,50 @@ fn read_clipboard_assets() -> Result<Vec<PathBuf>, String> {
         Ok(_) => Ok(Vec::new()),
         Err(arboard::Error::ContentNotAvailable) => Ok(Vec::new()),
         Err(err) => Err(err.to_string()),
+    }
+}
+
+/// 读取本进程累计 CPU 时间（秒）。性能探针专用，只在 Windows 上实现。
+fn process_cpu_seconds() -> Option<f64> {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetProcessTimes(
+                handle: isize,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        // SAFETY: 全是本进程内的临时结构体，句柄用 GetCurrentProcess 的伪句柄。
+        let ok = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let ticks = |time: FileTime| ((time.high as u64) << 32) | time.low as u64;
+        Some((ticks(kernel) + ticks(user)) as f64 / 10_000_000.0)
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }

@@ -11,6 +11,8 @@
 //! 令牌通过函数访问（`theme::bg()`），当前取值放在线程局部的 `ACTIVE` 里，
 //! 每帧开头由 `sync()` 按 egui 解析出的主题刷新。
 
+use std::sync::OnceLock;
+
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Theme,
     ThemePreference,
@@ -242,8 +244,13 @@ pub fn preference_label(value: ThemePreference) -> &'static str {
 
 // ---- 字体 ----------------------------------------------------------------
 
-/// 候选中文字体（只挑单体 ttf/otf，避免 ttc 字体集解析失败）。
+/// 候选中文字体。
+///
+/// 第一位是微软雅黑——Windows 中文界面的默认字体，和系统里其他程序的观感一致；
+/// 它是个 ttc 字体集，实测 `FontRef::try_from_slice_and_index(bytes, 0)` 能正常解析。
+/// 后面是各系统的兜底，哪个都没命中才退回 egui 自带的拉丁字体（中文会成方框）。
 const FONT_CANDIDATES: &[&str] = &[
+    "C:/Windows/Fonts/msyh.ttc",
     "C:/Windows/Fonts/Deng.ttf",
     "C:/Windows/Fonts/simhei.ttf",
     "C:/Windows/Fonts/Noto Sans SC (TrueType).otf",
@@ -255,18 +262,34 @@ const FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttf",
 ];
 
-fn load_cjk_font() -> Option<(String, Vec<u8>)> {
-    if let Ok(path) = std::env::var("FEIGECRAFT_FONT") {
-        if let Ok(bytes) = std::fs::read(&path) {
-            return Some(("cjk-user".to_string(), bytes));
+/// 字体字节读进内存后故意泄漏成 `'static`，全进程只留一份。
+///
+/// 为什么必须借 `'static`：epaint 的 `FontData::from_owned` 交给 ab_glyph 时会
+/// `bytes.clone()` 再复制一整份（见 `ab_glyph_font_from_font_data`），15 MB 的
+/// 中文字体实测要占三份——这是这个程序最大的一笔内存开销。改成 `from_static`
+/// 走 `FontRef` 借用那条路就是零拷贝，只剩我们自己读进来的那一份。
+///
+/// 字体与进程同寿，泄漏不算浪费；`OnceLock` 再兜一层，保证「补装 emoji 字体」
+/// 这类二次安装时不会重复读盘、重复泄漏。
+fn leaked(bytes: Vec<u8>) -> &'static [u8] {
+    Box::leak(bytes.into_boxed_slice())
+}
+
+fn cjk_font() -> Option<(&'static str, &'static [u8])> {
+    static CACHED: OnceLock<Option<(&'static str, &'static [u8])>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if let Ok(path) = std::env::var("FEIGECRAFT_FONT") {
+            if let Ok(bytes) = std::fs::read(&path) {
+                return Some(("cjk-user", leaked(bytes)));
+            }
         }
-    }
-    for candidate in FONT_CANDIDATES {
-        if let Ok(bytes) = std::fs::read(candidate) {
-            return Some(("cjk".to_string(), bytes));
+        for candidate in FONT_CANDIDATES {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                return Some(("cjk", leaked(bytes)));
+            }
         }
-    }
-    None
+        None
+    })
 }
 
 /// 系统 emoji 字体。egui 自带的是很小的子集，❤ ☀ ⭐ 这类常见符号会掉成方框，
@@ -278,36 +301,53 @@ const EMOJI_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/noto/NotoColorEmoji.ttf",
 ];
 
-fn load_emoji_font() -> Option<Vec<u8>> {
-    for candidate in EMOJI_CANDIDATES {
-        if let Ok(bytes) = std::fs::read(candidate) {
-            return Some(bytes);
+fn emoji_font() -> Option<&'static [u8]> {
+    static CACHED: OnceLock<Option<&'static [u8]>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        for candidate in EMOJI_CANDIDATES {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                return Some(leaked(bytes));
+            }
         }
-    }
-    None
+        None
+    })
 }
 
-pub fn install_fonts(ctx: &egui::Context) {
+/// 装上字体。
+///
+/// `with_emoji_fallback` 控制要不要挂系统 emoji 字体。这套字体在 Windows 上是
+/// `seguiemj.ttf`：12 MB 字体文件本身要常驻内存，再加上它是 COLR/CPAL 彩色字体、
+/// 到 ab_glyph 里只剩轮廓层，图集又要固化一大堆单色字形，合计十几 MB。而应用里
+/// 真正的表情（表情面板、输入框、聊天气泡）早就改成贴 Twemoji 贴图了，系统字体
+/// 只有在「遇到表情集之外的表情」时才用得上。
+///
+/// 所以启动时先不装，等正文里真的出现了表情集之外的表情，再调一次本函数补上
+/// （`FeigeCraftApp::ensure_emoji_font`）。常见使用场景能省下这十几 MB。
+pub fn install_fonts(ctx: &egui::Context, with_emoji_fallback: bool) {
     let mut fonts = FontDefinitions::default();
-    if let Some((name, bytes)) = load_cjk_font() {
-        fonts.font_data.insert(name.clone(), FontData::from_owned(bytes));
+    if let Some((name, bytes)) = cjk_font() {
+        tracing::info!("安装中文字体 {name} {:.1} MB", bytes.len() as f32 / 1048576.0);
+        // 用 `from_static`（借用）而不是 `from_owned`：后者会让 ab_glyph 复制一份。
+        fonts.font_data.insert(name.to_string(), FontData::from_static(bytes));
         fonts
             .families
             .entry(FontFamily::Proportional)
             .or_default()
-            .insert(0, name.clone());
-        fonts.families.entry(FontFamily::Monospace).or_default().push(name);
+            .insert(0, name.to_string());
+        fonts.families.entry(FontFamily::Monospace).or_default().push(name.to_string());
     } else {
         tracing::warn!("未找到中文字体，可在环境变量 FEIGECRAFT_FONT 指定 ttf/otf 路径");
     }
-    if let Some(bytes) = load_emoji_font() {
-        fonts.font_data.insert("emoji-system".to_string(), FontData::from_owned(bytes));
-        // 放在末尾：只是补齐缺失字形，不改变中文/拉丁的字体选择。
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .push("emoji-system".to_string());
+    if with_emoji_fallback {
+        if let Some(bytes) = emoji_font() {
+            fonts.font_data.insert("emoji-system".to_string(), FontData::from_static(bytes));
+            // 放在末尾：只是补齐缺失字形，不改变中文/拉丁的字体选择。
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .push("emoji-system".to_string());
+        }
     }
     ctx.set_fonts(fonts);
 }

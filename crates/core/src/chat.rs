@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -170,9 +171,52 @@ fn store_version() -> u32 {
 }
 
 /// 会话存储：内存态 + 落盘。
+///
+/// 落盘是**合并写**：`append` 只置脏标记，后台线程每 400ms 至多写一次，
+/// `Drop` 时补写最后一份。为什么不能每条都写：`append` 会把整个 StoreFile
+/// 序列化一遍再整文件覆盖，连发消息时就是「一条消息 = 一次全量序列化 + 一次
+/// 全文件写入」，聊天记录越长越慢（实测灌 3000 条要 5 秒）。
 pub struct ChatStore {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
     path: PathBuf,
     inner: Mutex<StoreFile>,
+    dirty: AtomicBool,
+}
+
+/// 合并写的时间窗口。比一帧长很多，又不至于让「刚发的消息」在崩溃时丢太久。
+const SAVE_INTERVAL: Duration = Duration::from_millis(400);
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if self.dirty.load(Ordering::Relaxed) {
+            self.write_now();
+        }
+    }
+}
+
+impl Shared {
+    /// 真正落盘：序列化 + 覆盖写。
+    fn write_now(&self) {
+        let text = {
+            let store = self.inner.lock().expect("chat store poisoned");
+            match serde_json::to_string_pretty(&*store) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!("序列化聊天记录失败：{err}");
+                    return;
+                }
+            }
+        };
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(err) = fs::write(&self.path, text) {
+            tracing::warn!("写入聊天记录失败：{err}");
+        }
+    }
 }
 
 impl ChatStore {
@@ -198,17 +242,36 @@ impl ChatStore {
             },
             Err(_) => StoreFile::default(),
         };
-        Self { path, inner: Mutex::new(inner) }
+        let shared = Arc::new(Shared {
+            path,
+            inner: Mutex::new(inner),
+            dirty: AtomicBool::new(false),
+        });
+        // 后台合并写线程：拿着弱引用，`ChatStore` 全部释放后自己退出。
+        let weak = Arc::downgrade(&shared);
+        let spawned = std::thread::Builder::new()
+            .name("chat-save".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(SAVE_INTERVAL);
+                let Some(shared) = weak.upgrade() else { break };
+                if shared.dirty.swap(false, Ordering::Relaxed) {
+                    shared.write_now();
+                }
+            });
+        if let Err(err) = spawned {
+            tracing::warn!("聊天记录合并写线程启动失败，改为同步落盘：{err}");
+        }
+        Self { shared }
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.shared.path
     }
 
-    /// 追加一条消息并落盘。
+    /// 追加一条消息（落盘交给合并写线程）。
     pub fn append(&self, message: ChatMessage) {
         {
-            let mut store = self.inner.lock().expect("chat store poisoned");
+            let mut store = self.shared.inner.lock().expect("chat store poisoned");
             let thread = store.threads.entry(message.peer.clone()).or_default();
             thread.push(message);
             let len = thread.len();
@@ -216,13 +279,23 @@ impl ChatStore {
                 thread.drain(..len - MAX_MESSAGES_PER_PEER);
             }
         }
-        self.save();
+        self.mark_dirty();
+    }
+
+    /// 立刻落盘（退出前 / 测试里用）。
+    pub fn flush(&self) {
+        self.shared.dirty.store(false, Ordering::Relaxed);
+        self.shared.write_now();
+    }
+
+    fn mark_dirty(&self) {
+        self.shared.dirty.store(true, Ordering::Relaxed);
     }
 
     /// 记录对端名字（用于离线展示）。
     pub fn touch_alias(&self, peer: &str, alias: &str) {
         let changed = {
-            let mut store = self.inner.lock().expect("chat store poisoned");
+            let mut store = self.shared.inner.lock().expect("chat store poisoned");
             if store.aliases.get(peer).map(String::as_str) == Some(alias) {
                 false
             } else {
@@ -231,12 +304,13 @@ impl ChatStore {
             }
         };
         if changed {
-            self.save();
+            self.mark_dirty();
         }
     }
 
     pub fn alias(&self, peer: &str) -> Option<String> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .expect("chat store poisoned")
             .aliases
@@ -246,7 +320,8 @@ impl ChatStore {
 
     /// 某个会话的全部消息（按时间升序）。
     pub fn thread(&self, peer: &str) -> Vec<ChatMessage> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .expect("chat store poisoned")
             .threads
@@ -256,7 +331,8 @@ impl ChatStore {
     }
 
     pub fn last(&self, peer: &str) -> Option<ChatMessage> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .expect("chat store poisoned")
             .threads
@@ -266,7 +342,7 @@ impl ChatStore {
 
     /// 所有有过聊天的对端及其最后一条消息，按时间倒序。
     pub fn peers(&self) -> Vec<(String, ChatMessage)> {
-        let store = self.inner.lock().expect("chat store poisoned");
+        let store = self.shared.inner.lock().expect("chat store poisoned");
         let mut list: Vec<(String, ChatMessage)> = store
             .threads
             .iter()
@@ -284,20 +360,20 @@ impl ChatStore {
     /// 更新某条消息的状态。
     pub fn set_status(&self, peer: &str, id: &str, status: MessageStatus) {
         {
-            let mut store = self.inner.lock().expect("chat store poisoned");
+            let mut store = self.shared.inner.lock().expect("chat store poisoned");
             if let Some(thread) = store.threads.get_mut(peer) {
                 if let Some(message) = thread.iter_mut().find(|item| item.id == id) {
                     message.status = status;
                 }
             }
         }
-        self.save();
+        self.mark_dirty();
     }
 
     /// 把消息与传输会话关联起来（文件气泡据此显示进度）。
     pub fn bind_session(&self, peer: &str, ids: &[String], session_id: &str) {
         {
-            let mut store = self.inner.lock().expect("chat store poisoned");
+            let mut store = self.shared.inner.lock().expect("chat store poisoned");
             if let Some(thread) = store.threads.get_mut(peer) {
                 for message in thread.iter_mut() {
                     if ids.iter().any(|id| id == &message.id) {
@@ -306,13 +382,13 @@ impl ChatStore {
                 }
             }
         }
-        self.save();
+        self.mark_dirty();
     }
 
     /// 记录接收到的文件落在哪里。
     pub fn set_file_path(&self, peer: &str, file_name: &str, path: PathBuf) -> bool {
         let updated = {
-            let mut store = self.inner.lock().expect("chat store poisoned");
+            let mut store = self.shared.inner.lock().expect("chat store poisoned");
             match store.threads.get_mut(peer) {
                 Some(thread) => {
                     // 从后往前找最近一条同名且还没落盘的文件消息
@@ -333,38 +409,41 @@ impl ChatStore {
             }
         };
         if updated {
-            self.save();
+            self.mark_dirty();
         }
         updated
+    }
+
+    /// 从会话里删掉一条消息（JSON 文件同步更新）。返回是否真的删掉了。
+    ///
+    /// 只动聊天记录，不碰磁盘上的文件——是否删文件由调用方决定，避免误删。
+    pub fn remove_message(&self, peer: &str, id: &str) -> bool {
+        let removed = {
+            let mut store = self.shared.inner.lock().expect("chat store poisoned");
+            match store.threads.get_mut(peer) {
+                Some(thread) => {
+                    let before = thread.len();
+                    thread.retain(|message| message.id != id);
+                    thread.len() != before
+                }
+                None => false,
+            }
+        };
+        if removed {
+            self.mark_dirty();
+        }
+        removed
     }
 
     /// 清空某个会话（JSON 文件同步更新）。
     pub fn clear(&self, peer: &str) {
         {
-            let mut store = self.inner.lock().expect("chat store poisoned");
+            let mut store = self.shared.inner.lock().expect("chat store poisoned");
             store.threads.remove(peer);
         }
-        self.save();
+        self.mark_dirty();
     }
 
-    fn save(&self) {
-        let text = {
-            let store = self.inner.lock().expect("chat store poisoned");
-            match serde_json::to_string_pretty(&*store) {
-                Ok(text) => text,
-                Err(err) => {
-                    tracing::warn!("序列化聊天记录失败：{err}");
-                    return;
-                }
-            }
-        };
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Err(err) = fs::write(&self.path, text) {
-            tracing::warn!("写入聊天记录失败：{err}");
-        }
-    }
 }
 
 /// 对端标识：优先指纹，缺失时退回名字。
@@ -394,6 +473,8 @@ mod tests {
         store.touch_alias("fp1", "客厅电脑");
         store.append(ChatMessage::text("fp1", true, "你好"));
         store.append(ChatMessage::text("fp1", false, "收到"));
+        // 落盘是合并写的，重载前要手动 flush，否则读到的还是旧文件。
+        store.flush();
 
         let reloaded = ChatStore::load(store.path());
         let thread = reloaded.thread("fp1");
@@ -402,6 +483,27 @@ mod tests {
         assert!(thread[0].outgoing);
         assert!(!thread[1].outgoing);
         assert_eq!(reloaded.alias("fp1").as_deref(), Some("客厅电脑"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_message_drops_one_and_persists() {
+        let (store, dir) = temp_store("remove");
+        let keep = ChatMessage::text("fp1", true, "留着");
+        let drop = ChatMessage::text("fp1", false, "删掉");
+        let drop_id = drop.id.clone();
+        store.append(keep);
+        store.append(drop);
+
+        assert!(store.remove_message("fp1", &drop_id));
+        // 再删同一个 id 应该返回 false（已经没有了），避免上层误判。
+        assert!(!store.remove_message("fp1", &drop_id));
+        store.flush();
+
+        let reloaded = ChatStore::load(store.path());
+        let thread = reloaded.thread("fp1");
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].text, "留着");
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -67,6 +67,7 @@ pub enum Icon {
     Sliders,
     Smile,
     More,
+    Clipboard,
 }
 
 impl Icon {
@@ -132,6 +133,18 @@ impl Icon {
                 }
                 painter.add(egui::Shape::line(mouth, stroke));
             }
+            Icon::Clipboard => {
+                // 剪贴板：主体圆角矩形 + 顶部小夹子
+                let body = egui::Rect::from_min_max(map(0.24, 0.32), map(0.76, 0.86));
+                painter.rect_stroke(
+                    body,
+                    egui::Rounding::same(rect.width() * 0.08),
+                    stroke,
+                );
+                painter.line_segment([map(0.4, 0.24), map(0.4, 0.32)], stroke);
+                painter.line_segment([map(0.6, 0.24), map(0.6, 0.32)], stroke);
+                painter.line_segment([map(0.38, 0.26), map(0.62, 0.26)], stroke);
+            }
         }
     }
 }
@@ -162,13 +175,28 @@ pub fn time_hm(ms: u64) -> String {
     }
 }
 
+thread_local! {
+    /// 本帧的「今天」。`Local::now()` 要走一遍时区表，逐条消息调用在长会话里
+    /// 是实打实的开销（400 条 × 60fps = 每秒两万多次），改成每帧只取一次。
+    static TODAY: std::cell::Cell<Option<chrono::NaiveDate>> = const { std::cell::Cell::new(None) };
+}
+
+/// 每帧开头调一次，刷新「今天」。
+pub fn begin_frame() {
+    TODAY.with(|cell| cell.set(Some(chrono::Local::now().date_naive())));
+}
+
+fn today() -> chrono::NaiveDate {
+    TODAY.with(|cell| cell.get()).unwrap_or_else(|| chrono::Local::now().date_naive())
+}
+
 /// 消息流里的日期分隔：「今天」「昨天」「11月3日」「2025年11月3日」
 pub fn day_label(ms: u64) -> String {
     use chrono::{Datelike, Local, TimeZone};
     let Some(dt) = Local.timestamp_millis_opt(ms as i64).single() else {
         return String::new();
     };
-    let today = Local::now().date_naive();
+    let today = today();
     let date = dt.date_naive();
     if date == today {
         tr("今天").to_string()
@@ -190,7 +218,7 @@ pub fn list_time(ms: u64) -> String {
     let Some(dt) = Local.timestamp_millis_opt(ms as i64).single() else {
         return String::new();
     };
-    let today = Local::now().date_naive();
+    let today = today();
     let date = dt.date_naive();
     if date == today {
         dt.format("%H:%M").to_string()

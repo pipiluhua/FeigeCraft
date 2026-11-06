@@ -339,7 +339,9 @@ fn main() -> eframe::Result<()> {
         "FeigeCraft · 局域网聊天与快传",
         options,
         Box::new(move |cc| {
-            theme::install_fonts(&cc.egui_ctx);
+            // 表情兜底字体（12 MB）先不装：正文里真出现表情集之外的表情时，
+            // 由 FeigeCraftApp::ensure_emoji_font 按需补上。
+            theme::install_fonts(&cc.egui_ctx, false);
             theme::install_style(&cc.egui_ctx);
             round_window_corners(cc);
             // 先把窗口句柄记下来，后台线程才能在窗口隐藏时把它重新亮出来。
