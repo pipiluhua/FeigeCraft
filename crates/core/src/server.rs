@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
@@ -416,7 +416,7 @@ async fn upload_handler(
     }
 
     let part_path = dir.join(format!(".feigecraft-{}.part", Uuid::new_v4()));
-    let mut file = match tokio::fs::File::create(&part_path).await {
+    let file = match tokio::fs::File::create(&part_path).await {
         Ok(file) => file,
         Err(err) => {
             receiver
@@ -425,6 +425,8 @@ async fn upload_handler(
             return (StatusCode::INTERNAL_SERVER_ERROR, "无法写入下载目录").into_response();
         }
     };
+    // 大缓冲写入，避免每次收到小块就写盘一次拖慢吞吐。
+    let mut file = BufWriter::with_capacity(4 * 1024 * 1024, file);
 
     let mut stream = body.into_data_stream();
     let mut written = 0u64;
@@ -448,7 +450,7 @@ async fn upload_handler(
             break;
         }
         written += chunk.len() as u64;
-        if last_emit.elapsed() >= Duration::from_millis(100) {
+        if last_emit.elapsed() >= Duration::from_millis(50) {
             last_emit = Instant::now();
             receiver.state.emit(AppEvent::FileProgress {
                 session_id: session_id.clone(),

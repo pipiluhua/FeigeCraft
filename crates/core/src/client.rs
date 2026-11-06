@@ -14,6 +14,10 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 
+/// 上传流的读缓冲大小。局域网直传，4MB 的块能显著减少 syscall 与 TLS 记录切分，
+/// 把千兆网络吞吐跑满（64KB 时单连接 HTTP/1.1 会被小缓冲拖慢）。
+const UPLOAD_BUF_SIZE: usize = 4 * 1024 * 1024;
+
 use crate::chat::{peer_key, ChatEnvelope, ChatMessage, ChatPayload, MessageStatus};
 use crate::events::AppEvent;
 use crate::model::{
@@ -279,29 +283,33 @@ async fn upload_one(
     let done = Arc::new(AtomicU64::new(0));
 
     let reader = ProgressReader {
-        inner: tokio::io::BufReader::with_capacity(64 * 1024, file),
+        inner: tokio::io::BufReader::with_capacity(UPLOAD_BUF_SIZE, file),
         done: done.clone(),
     };
-    let body = reqwest::Body::wrap_stream(ReaderStream::with_capacity(reader, 64 * 1024));
+    let body = reqwest::Body::wrap_stream(ReaderStream::with_capacity(reader, UPLOAD_BUF_SIZE));
 
-    // 进度心跳
+    // 进度上报：每读满一块立即上报，但对界面限频，避免刷屏。
     let ticker = {
         let state = state.clone();
         let file_name = meta.file_name.clone();
         let session_id = session_id.to_string();
         let done = done.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(150));
+            let mut ticker = tokio::time::interval(Duration::from_millis(50));
+            let mut last = 0u64;
             loop {
                 ticker.tick().await;
                 let transferred = done.load(Ordering::Relaxed);
-                state.emit(AppEvent::FileProgress {
-                    session_id: session_id.clone(),
-                    file_name: file_name.clone(),
-                    transferred,
-                    total: total.max(transferred),
-                    direction: Direction::Send,
-                });
+                if transferred != last || transferred >= total {
+                    state.emit(AppEvent::FileProgress {
+                        session_id: session_id.clone(),
+                        file_name: file_name.clone(),
+                        transferred,
+                        total: total.max(transferred),
+                        direction: Direction::Send,
+                    });
+                    last = transferred;
+                }
                 if transferred >= total {
                     return;
                 }

@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "feigecraft-cli"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "feigecraft-core"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "feigecraft-gui"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "arboard",
  "chrono",
