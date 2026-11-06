@@ -200,6 +200,10 @@ pub struct FeigeCraftApp {
     emojis: EmojiSet,
     /// 从剪贴板粘贴、尚未发送的图片（临时 PNG 路径）。点「发送」时随文字一起发出。
     pending_images: Vec<PathBuf>,
+    /// 上一帧 Ctrl（或 macOS 的 Cmd）是否处于按下状态。用于在 V 键「按下」事件被
+    /// egui 吞掉（Ctrl+V 会转成 Paste / 纯图片时被完全吞掉）的情况下，靠「松开」事件
+    /// 兜底识别粘贴意图。
+    ctrl_was_down: bool,
 
     settings_open: bool,
     settings_tab: SettingsTab,
@@ -317,6 +321,7 @@ impl FeigeCraftApp {
             emoji_anchor: Rect::NOTHING,
             emojis: EmojiSet::load(ctx),
             pending_images: Vec::new(),
+            ctrl_was_down: false,
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
             remark_target: None,
@@ -4004,53 +4009,92 @@ impl FeigeCraftApp {
         }
     }
 
-    /// Ctrl+V 且输入框没聚焦时，把剪贴板里的图片落成临时 PNG 进入待发列表。
+    /// Ctrl+V 且输入框没聚焦时，把剪贴板里的图片 / 文件落到待发送列表。
     /// 输入框聚焦时 Ctrl+V 是正常的文字粘贴，这里不拦截。
+    ///
+    /// 关键背景：egui-winit 会把 Ctrl+V 的「V 按下」事件吞掉，转成 `Event::Paste`
+    /// （仅当剪贴板里有文本时），纯图片 / 纯文件时连 Paste 都不推。所以不能靠
+    /// `key_pressed(Key::V)` 检测粘贴，它永远为 false。这里改用两条可靠信号：
+    /// ① `Event::Paste`（剪贴板含文本）；② V 键的「松开」事件 + Ctrl 按住（V 的
+    /// 按下被吞、但松开会正常派发）。
     fn paste_from_clipboard(&mut self, ctx: &egui::Context) {
         if self.active.is_none() {
             return;
         }
-        let pasted = ctx.input(|input| {
-            input.modifiers.command && input.key_pressed(egui::Key::V)
+        // 先读本帧输入，再更新 ctrl_was_down（用完之后再记，避免自读自写）。
+        let (paste_event, v_released, ctrl_down) = ctx.input(|input| {
+            let paste = input
+                .events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Paste(_)));
+            let v_released = input.key_released(egui::Key::V);
+            (paste, v_released, input.modifiers.command)
         });
-        if !pasted || self.composer_focused {
+        let ctrl_held = ctrl_down || self.ctrl_was_down;
+        self.ctrl_was_down = ctrl_down;
+
+        if self.composer_focused {
             return;
         }
-        match clipboard_image_to_png() {
-            Ok(Some(path)) => {
-                self.pending_images.push(path);
-                self.toast(tr("已粘贴图片，点发送即可发出"), false);
+        // 有文本时 egui 会推 Paste；纯图片/纯文件时靠「V 松开 + Ctrl 按着」识别。
+        if !paste_event && !(v_released && ctrl_held) {
+            return;
+        }
+
+        match read_clipboard_assets() {
+            Ok(assets) if !assets.is_empty() => {
+                for path in assets {
+                    self.pending_images.push(path);
+                }
+                self.toast(tr("已粘贴，点发送即可发出"), false);
             }
-            Ok(None) => {
-                // 剪贴板里没有图片，忽略（可能是纯文字，等用户点输入框再粘）。
+            Ok(_) => {
+                // 剪贴板里既没图片也没文件，忽略（纯文字，等用户点输入框再粘）。
             }
             Err(err) => {
-                self.toast(tf(tr("读取剪贴板图片失败：{}"), &[&err]), true);
+                self.toast(tf(tr("读取剪贴板失败：{}"), &[&err]), true);
             }
         }
     }
 }
 
-/// 读取系统剪贴板里的图片，编码成 PNG 写进临时目录，返回文件路径。
-/// 剪贴板里没有图片时返回 `Ok(None)`。
-fn clipboard_image_to_png() -> Result<Option<PathBuf>, String> {
+/// 读取系统剪贴板里的图片和文件，落成可发送的本地路径。
+/// 图片（截图）优先，其次是被复制的文件（Windows 资源管理器里 Ctrl+C 的文件）。
+/// 两者都没有时返回空 Vec。
+fn read_clipboard_assets() -> Result<Vec<PathBuf>, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|err| err.to_string())?;
-    let image = match clipboard.get_image() {
-        Ok(image) => image,
-        // 剪贴板里没有图片（比如只有文字）——正常情况，静默忽略。
-        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
-        Err(err) => return Err(err.to_string()),
-    };
-    // RGBA 原始字节 → image crate 的 RgbaImage → 编码 PNG。
-    let rgba =
-        image::RgbaImage::from_raw(image.width as u32, image.height as u32, image.bytes.into_owned())
+
+    // 1) 图片：截图工具放的位图，编码成 PNG 落盘。
+    match clipboard.get_image() {
+        Ok(image) => {
+            let rgba = image::RgbaImage::from_raw(
+                image.width as u32,
+                image.height as u32,
+                image.bytes.into_owned(),
+            )
             .ok_or_else(|| "图片数据长度与尺寸不符".to_string())?;
-    let dir = std::env::temp_dir().join("feigecraft");
-    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join(format!("paste-{}.png", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)));
-    rgba.save_with_format(&path, image::ImageFormat::Png).map_err(|err| err.to_string())?;
-    Ok(Some(path))
+            let dir = std::env::temp_dir().join("feigecraft");
+            std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+            let path = dir.join(format!(
+                "paste-{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ));
+            rgba.save_with_format(&path, image::ImageFormat::Png)
+                .map_err(|err| err.to_string())?;
+            return Ok(vec![path]);
+        }
+        Err(arboard::Error::ContentNotAvailable) => {}
+        Err(err) => return Err(err.to_string()),
+    }
+
+    // 2) 文件：资源管理器里复制的一批文件。
+    match clipboard.get().file_list() {
+        Ok(files) if !files.is_empty() => Ok(files),
+        Ok(_) => Ok(Vec::new()),
+        Err(arboard::Error::ContentNotAvailable) => Ok(Vec::new()),
+        Err(err) => Err(err.to_string()),
+    }
 }
